@@ -1,4 +1,10 @@
-# WE 工坊（WE Workshop）
+<div align="center">
+
+<h1>WE 工坊（WE Workshop）</h1>
+
+<a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh"></a>
+
+</div>
 
 一个 Android 客户端，用来在手机上浏览并下载 **Wallpaper Engine**（壁纸引擎）的 Steam 创意工坊内容。
 
