@@ -172,6 +172,26 @@ public class Bridge {
         WorkshopDownloader.cancel();
     }
 
+    /** 查询某个条目当前下载进度（JSON），界面重建/重进详情页时用来恢复进度条。 */
+    @JavascriptInterface
+    public String downloadState(String itemId) {
+        try {
+            return WorkshopDownloader.progressJson(Long.parseLong(itemId));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** 某个条目是否还有下载任务在跑。 */
+    @JavascriptInterface
+    public boolean isDownloading(String itemId) {
+        try {
+            return WorkshopDownloader.isActive(Long.parseLong(itemId));
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
     /** 取消指定条目的下载（下载列表里的「取消」按钮）。 */
     @JavascriptInterface
     public void cancelDownloadById(String itemId) {

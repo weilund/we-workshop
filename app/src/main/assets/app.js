@@ -330,6 +330,17 @@ async function openDetail(id, hint) {
     title: (hint && hint.title) || item.title,
     preview_url: (hint && hint.img) || item.img,
   }, known));
+  // WebView 重建（切后台被回收等）后内存里可能没有进度记录，
+  // 此时从原生下载器恢复一次，避免「列表在下载但详情页没有进度条」。
+  if (!state.downloads[key] && window.Bridge.downloadState) {
+    try {
+      const raw = window.Bridge.downloadState(key);
+      if (raw) {
+        const p = JSON.parse(raw);
+        if (p) state.downloads[key] = p;
+      }
+    } catch (e) { /* ignore */ }
+  }
   resetDetailProgress(key);
   document.getElementById('detail').classList.remove('hidden');
   document.getElementById('detail').scrollTop = 0;
@@ -665,6 +676,23 @@ function startDownload(d) {
   if (!steam.loggedIn) {
     window.Bridge.toast('请先在设置中登录 Steam');
     openSettings();
+    return;
+  }
+  // 已经在下载中的条目不要重复启动（重复启动会并发写同一文件）
+  const key = String(d.id);
+  const cur = state.downloads[key];
+  if (cur && !cur.done && !cur.error) {
+    renderDetailProgress(cur);
+    window.Bridge.toast('该条目正在下载中…');
+    return;
+  }
+  if (window.Bridge.isDownloading && window.Bridge.isDownloading(key)) {
+    try {
+      const raw = window.Bridge.downloadState ? window.Bridge.downloadState(key) : null;
+      if (raw) state.downloads[key] = JSON.parse(raw);
+    } catch (e) { /* ignore */ }
+    resetDetailProgress(key);
+    window.Bridge.toast('该条目正在下载中…');
     return;
   }
   const mid = String((d && (d.hcontent_file || d.manifest)) || '0');

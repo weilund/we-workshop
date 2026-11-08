@@ -12,9 +12,11 @@ import `in`.dragonbra.javasteam.enums.EResult
 import `in`.dragonbra.javasteam.steam.cdn.Client
 import `in`.dragonbra.javasteam.steam.cdn.DepotChunk
 import `in`.dragonbra.javasteam.steam.cdn.Server
+import `in`.dragonbra.javasteam.types.ChunkData
 import `in`.dragonbra.javasteam.types.DepotManifest
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -23,7 +25,9 @@ import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Wallpaper Engine 创意工坊源文件下载器。
@@ -72,6 +76,30 @@ object WorkshopDownloader {
     private val manifests = java.util.concurrent.ConcurrentHashMap<Long, Long>()
     private val cancelledItems = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
     private val lastProgress = java.util.concurrent.ConcurrentHashMap<Long, Progress>()
+    private val lastPersistAt = ConcurrentHashMap<Long, Long>()
+
+    /** 当前是否有该条目的下载在跑（供界面判断，避免重复启动） */
+    @JvmStatic
+    fun isActive(itemId: Long): Boolean = activeItems.contains(itemId)
+
+    /** 返回某条目最近一次进度（JSON），用于界面重建/重进详情页时恢复进度条 */
+    @JvmStatic
+    fun progressJson(itemId: Long): String? {
+        val p = lastProgress[itemId] ?: return null
+        val err = p.error
+        return buildString {
+            append("{\"itemId\":").append(p.itemId)
+            append(",\"received\":").append(p.received)
+            append(",\"total\":").append(p.total)
+            append(",\"phase\":\"").append(jsonEscape(p.phase)).append('"')
+            append(",\"done\":").append(p.done)
+            append(",\"error\":").append(if (err == null) "null" else "\"" + jsonEscape(err) + "\"")
+            append('}')
+        }
+    }
+
+    private fun jsonEscape(s: String): String =
+        s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ").replace("\r", " ")
 
     @JvmStatic
     fun cancel(itemId: Long) {
@@ -85,21 +113,27 @@ object WorkshopDownloader {
 
     fun isCancelled(itemId: Long): Boolean = cancelledItems.contains(itemId)
 
-    private fun emit(p: Progress) {
+    private fun emit(p: Progress, persist: Boolean = true) {
         lastProgress[p.itemId] = p
-        val status = when {
-            p.error == "已取消" -> "canceled"
-            p.error != null -> "failed"
-            p.done -> "done"
-            else -> "downloading"
-        }
-        runCatching {
-            DownloadStore.upsert(
-                p.itemId,
-                titles[p.itemId] ?: "",
-                images[p.itemId] ?: "",
-                p.total, p.received, status, manifests[p.itemId] ?: 0L
-            )
+        val terminal = p.done || p.error != null
+        val now = System.currentTimeMillis()
+        val shouldPersist = persist && (terminal || now - (lastPersistAt[p.itemId] ?: 0L) >= 1500L)
+        if (shouldPersist) {
+            lastPersistAt[p.itemId] = now
+            val status = when {
+                p.error == "已取消" -> "canceled"
+                p.error != null -> "failed"
+                p.done -> "done"
+                else -> "downloading"
+            }
+            runCatching {
+                DownloadStore.upsert(
+                    p.itemId,
+                    titles[p.itemId] ?: "",
+                    images[p.itemId] ?: "",
+                    p.total, p.received, status, manifests[p.itemId] ?: 0L
+                )
+            }
         }
         listener?.onProgress(p.itemId, p.received, p.total, p.phase, p.done, p.error)
     }
@@ -116,7 +150,11 @@ object WorkshopDownloader {
         DownloadStore.init(context)
         if (!title.isNullOrEmpty()) titles[itemId] = title
         if (!img.isNullOrEmpty()) images[itemId] = img
-        activeItems.add(itemId)
+        // 同一任务重复点击时不重复启动，避免并发写同一文件
+        if (!activeItems.add(itemId)) {
+            lastProgress[itemId]?.let { emit(it, persist = false) }
+            return
+        }
         cancelledItems.remove(itemId)
         manifests[itemId] = manifestId
         CoroutineScope(Dispatchers.IO).launch {
@@ -217,7 +255,7 @@ object WorkshopDownloader {
         diag.append("授权码=").append(requestCode).append(';')
 
         // CDN 的 manifest / chunk 请求需要 per-host 的 auth token，缺了会 403。
-        val tokenCache = HashMap<String, String>()
+        val tokenCache = ConcurrentHashMap<String, String>()
         suspend fun tokenFor(server: Server): String {
             val key = server.host ?: ""
             if (tokenCache.containsKey(key)) return tokenCache[key] ?: ""
@@ -292,44 +330,74 @@ object WorkshopDownloader {
         var received = existingBytes
         emit(Progress(itemId, received, totalBytes, if (existingBytes > 0) "继续下载" else "开始下载"))
 
+        // 每个文件内的 chunk 分 4 路并行下载（Steam CDN 支持多连接，单连接容易被限速/等 RTT）
+        val parallelism = 4
+        val lastEmitAt = AtomicLong(0L)
+        var downloadedNow = received
         for (file in filesToDownload) {
             checkCancelled(itemId)
             val outFile = File(staging, sanitizePath(file.fileName))
             outFile.parentFile?.mkdirs()
 
             val existingLen = if (outFile.exists()) outFile.length() else 0L
-            RandomAccessFile(outFile, "rw").use { raf ->
-                for (chunk in file.chunks.sortedBy { it.offset }) {
-                    checkCancelled(itemId)
-                    // 已完整写入的 chunk 跳过（续传）
-                    if (existingLen > 0L && chunk.offset + chunk.uncompressedLength.toLong() <= existingLen) continue
-                    val encrypted = ByteArray(chunk.compressedLength)
-                    val plain = ByteArray(chunk.uncompressedLength)
-                    var ok = false
-                    var err: Throwable? = null
-                    for (server in candidateServers.take(4)) {
-                        try {
-                            val token = tokenFor(server)
-                            cdn.downloadDepotChunkFuture(
-                                WORKSHOP_DEPOT_ID, chunk, server, encrypted, null, null,
-                                token.trimStart('?').ifEmpty { null }
-                            ).get(120, TimeUnit.SECONDS)
-                            ok = true
-                            break
-                        } catch (t: Throwable) {
-                            err = t
-                            Log.w(TAG, "chunk ${chunk.chunkID?.size ?: 0} from ${server.host} failed: ${t.message}")
+            val pending = file.chunks.sortedBy { it.offset }.filterNot { chunk ->
+                // 已完整写入的 chunk 跳过（续传）
+                existingLen > 0L && chunk.offset + chunk.uncompressedLength.toLong() <= existingLen
+            }
+            if (pending.isEmpty()) continue
+
+            val counter = AtomicLong(downloadedNow)
+            val speedStartMs = System.currentTimeMillis()
+            val speedStartBytes = downloadedNow
+            coroutineScope {
+                val groups = List(parallelism) { ArrayList<ChunkData>() }
+                pending.forEachIndexed { i, c -> groups[i % parallelism].add(c) }
+                groups.filter { it.isNotEmpty() }.map { group ->
+                    launch(Dispatchers.IO) {
+                        // 每组用自己的 RandomAccessFile，写不同 offset 区域，互不干扰
+                        RandomAccessFile(outFile, "rw").use { raf ->
+                            for (chunk in group) {
+                                checkCancelled(itemId)
+                                val encrypted = ByteArray(chunk.compressedLength)
+                                val plain = ByteArray(chunk.uncompressedLength)
+                                var ok = false
+                                var err: Throwable? = null
+                                for (server in candidateServers.take(4)) {
+                                    try {
+                                        val token = tokenFor(server)
+                                        cdn.downloadDepotChunkFuture(
+                                            WORKSHOP_DEPOT_ID, chunk, server, encrypted, null, null,
+                                            token.trimStart('?').ifEmpty { null }
+                                        ).get(120, TimeUnit.SECONDS)
+                                        ok = true
+                                        break
+                                    } catch (t: Throwable) {
+                                        err = t
+                                        Log.w(TAG, "chunk ${chunk.chunkID?.size ?: 0} from ${server.host} failed: ${t.message}")
+                                    }
+                                }
+                                if (!ok) throw IllegalStateException("下载分块失败：${err?.message}")
+                                val written = DepotChunk.process(chunk, encrypted, plain, depotKey)
+                                raf.seek(chunk.offset)
+                                raf.write(plain, 0, written)
+                                val total = counter.addAndGet(written.toLong())
+                                val now = System.currentTimeMillis()
+                                // 节流：最多每 250ms 刷新一次界面 & 落盘，避免频繁回调造成卡顿
+                                if (now - lastEmitAt.get() >= 250L) {
+                                    lastEmitAt.set(now)
+                                    val elapsed = (now - speedStartMs) / 1000.0
+                                    val speed = if (elapsed > 0.8) (total - speedStartBytes) / elapsed / 1048576.0 else -1.0
+                                    val phase = if (speed > 0) String.format(Locale.US, "下载中 %.1f MB/s", speed) else "下载中"
+                                    emit(Progress(itemId, total, totalBytes, phase), persist = false)
+                                }
+                            }
                         }
                     }
-                    if (!ok) throw IllegalStateException("下载分块失败：${err?.message}")
-                    val written = DepotChunk.process(chunk, encrypted, plain, depotKey)
-                    raf.seek(chunk.offset)
-                    raf.write(plain, 0, written)
-                    received += written
-                    emit(Progress(itemId, received, totalBytes, "下载中"))
-                }
+                }.forEach { it.join() }
             }
+            downloadedNow = counter.get()
         }
+        received = downloadedNow
 
         emit(Progress(itemId, received, totalBytes, "保存到 Download…"))
         val target = copyToDownloads(context, itemId, staging)
