@@ -598,13 +598,23 @@ function renderDownloads() {
   }
   arr.sort((a, b) => (b.time || 0) - (a.time || 0));
   box.innerHTML = arr.map(d => {
-    const pct = d.size > 0 ? Math.min(100, Math.round((d.received / d.size) * 100)) : 0;
+    // 进度以内存里的实时回调为准（详情页同源），持久化记录可能滞后 1~2 秒
+    const lp = state.downloads[String(d.id)];
+    let status = d.status;
+    if (lp) {
+      if (lp.error === '已取消') status = 'canceled';
+      else if (lp.error) status = 'failed';
+      else if (lp.done) status = 'done';
+      else status = 'downloading';
+    }
+    const liveReceived = (lp && !lp.done && !lp.error) ? lp.received : d.received;
+    const liveTotal = (lp && lp.total > 0) ? lp.total : d.size;
+    const pct = liveTotal > 0 ? Math.min(100, Math.round((liveReceived / liveTotal) * 100)) : 0;
     let statusText;
-    if (d.status === 'done') statusText = '已完成';
-    else if (d.status === 'failed') statusText = '失败';
-    else if (d.status === 'canceled') statusText = '已取消';
+    if (status === 'done') statusText = '已完成';
+    else if (status === 'failed') statusText = '失败';
+    else if (status === 'canceled') statusText = '已取消';
     else {
-      const lp = state.downloads[String(d.id)];
       statusText = (lp && lp.phase && /自动重试|继续下载/.test(lp.phase)) ? lp.phase : ('下载中 ' + pct + '%');
     }
     const img = d.img ? '<img src="' + escHtml(d.img) + '" alt="" loading="lazy">' : '<div class="dl-ph"></div>';
@@ -613,16 +623,16 @@ function renderDownloads() {
       + '<div class="dl-thumb">' + img + '</div>'
       + '<div class="dl-meta">'
       + '<div class="dl-title">' + escHtml(d.title || ('ID ' + d.id)) + '</div>'
-      + '<div class="dl-status dl-' + escHtml(d.status) + '">' + statusText
+      + '<div class="dl-status dl-' + escHtml(status) + '">' + statusText
       + (d.size ? ' · ' + fmtSize(d.size) : '') + '</div>'
       + '</div>'
       + '<div class="dl-actions">'
-      + (d.status === 'done'
+      + (status === 'done'
         ? '<button class="dl-open" data-open="' + escHtml(d.id) + '">打开文件夹</button>'
-        : (d.status === 'downloading'
+        : (status === 'downloading'
           ? '<button class="dl-cancel" data-cancel="' + escHtml(d.id) + '">取消</button>'
           : '<button class="dl-retry" data-retry="' + escHtml(d.id) + '" data-manifest="' + escHtml(d.manifest || '') + '" data-title="' + escHtml(d.title || '') + '" data-img="' + escHtml(d.img || '') + '">重试</button>'))
-      + (d.status === 'done' ? '' : '<button class="dl-del" data-del="' + escHtml(d.id) + '">移除</button>')
+      + (status === 'done' ? '' : '<button class="dl-del" data-del="' + escHtml(d.id) + '">移除</button>')
       + '</div>'
       + '</div>';
   }).join('');
