@@ -18,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -75,6 +76,7 @@ object WorkshopDownloader {
     private val activeItems = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
     private val manifests = java.util.concurrent.ConcurrentHashMap<Long, Long>()
     private val cancelledItems = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+    private val jobs = ConcurrentHashMap<Long, Job>()
     private val lastProgress = java.util.concurrent.ConcurrentHashMap<Long, Progress>()
     private val lastPersistAt = ConcurrentHashMap<Long, Long>()
 
@@ -104,11 +106,16 @@ object WorkshopDownloader {
     @JvmStatic
     fun cancel(itemId: Long) {
         cancelledItems.add(itemId)
+        // 立即把「已取消」推到界面和下载记录，不必等阻塞中的网络请求返回
+        val lp = lastProgress[itemId]
+        emit(Progress(itemId, lp?.received ?: 0L, lp?.total ?: 0L, "已取消", error = "已取消"))
+        jobs[itemId]?.cancel()
     }
 
     @JvmStatic
     fun cancel() {
         cancelledItems.addAll(activeItems)
+        activeItems.toList().forEach { cancel(it) }
     }
 
     fun isCancelled(itemId: Long): Boolean = cancelledItems.contains(itemId)
@@ -157,7 +164,7 @@ object WorkshopDownloader {
         }
         cancelledItems.remove(itemId)
         manifests[itemId] = manifestId
-        CoroutineScope(Dispatchers.IO).launch {
+        val job = CoroutineScope(Dispatchers.IO).launch {
             var attempt = 0
             try {
                 while (true) {
@@ -169,7 +176,8 @@ object WorkshopDownloader {
                         Log.e(TAG, "download failed for $itemId (attempt ${attempt + 1})", t)
                         logFile(context, "FAIL item=$itemId manifest=$manifestId attempt=${attempt + 1}: ${t.message}")
                         if (cancelled) {
-                            emit(Progress(itemId, 0, 0, "已取消", error = "已取消"))
+                            val cur = lastProgress[itemId]
+                            emit(Progress(itemId, cur?.received ?: 0L, cur?.total ?: 0L, "已取消", error = "已取消"))
                             return@launch
                         }
                         attempt++
@@ -194,15 +202,19 @@ object WorkshopDownloader {
                         )
                         delay(delayMs)
                         if (isCancelled(itemId)) {
-                            emit(Progress(itemId, 0, 0, "已取消", error = "已取消"))
+                            val cur = lastProgress[itemId]
+                            emit(Progress(itemId, cur?.received ?: 0L, cur?.total ?: 0L, "已取消", error = "已取消"))
                             return@launch
                         }
                     }
                 }
             } finally {
                 activeItems.remove(itemId)
+                jobs.remove(itemId)
             }
         }
+        jobs[itemId] = job
+        if (job.isCompleted) jobs.remove(itemId)
     }
 
     private suspend fun download(context: Context, itemId: Long, manifestId: Long) {
@@ -283,7 +295,7 @@ object WorkshopDownloader {
                 manifest = cdn.downloadManifestFuture(
                     WORKSHOP_DEPOT_ID, manifestId, requestCode, server, depotKey, null,
                     token.trimStart('?').ifEmpty { null }
-                ).get(120, TimeUnit.SECONDS)
+                ).get(30, TimeUnit.SECONDS)
                 break
             } catch (t: Throwable) {
                 lastErr = t
@@ -368,7 +380,7 @@ object WorkshopDownloader {
                                         cdn.downloadDepotChunkFuture(
                                             WORKSHOP_DEPOT_ID, chunk, server, encrypted, null, null,
                                             token.trimStart('?').ifEmpty { null }
-                                        ).get(120, TimeUnit.SECONDS)
+                                        ).get(30, TimeUnit.SECONDS)
                                         ok = true
                                         break
                                     } catch (t: Throwable) {
