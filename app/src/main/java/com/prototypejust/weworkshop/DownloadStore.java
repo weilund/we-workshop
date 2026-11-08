@@ -109,4 +109,16 @@ public final class DownloadStore {
         if (prefs == null) return;
         prefs.edit().putString(KEY, "[]").apply();
     }
+
+    /** 只清除已完成的记录，保留下载中/失败/已取消的记录。 */
+    public static synchronized void clearFinished() {
+        if (prefs == null) return;
+        JSONArray arr = list();
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject o = arr.optJSONObject(i);
+            if (o != null && !"done".equals(o.optString("status"))) out.put(o);
+        }
+        prefs.edit().putString(KEY, out.toString()).apply();
+    }
 }

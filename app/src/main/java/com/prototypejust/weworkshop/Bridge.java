@@ -259,6 +259,11 @@ public class Bridge {
         DownloadStore.clear();
     }
 
+    @JavascriptInterface
+    public void clearFinishedDownloads() {
+        DownloadStore.clearFinished();
+    }
+
     /** 打开 Download/Wallpaper WE/<id>/ 所在目录（系统文件管理器）。 */
     @JavascriptInterface
     public void openDownloadFolder(String itemId) {

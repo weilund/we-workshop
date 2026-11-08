@@ -593,9 +593,9 @@ function closeDownloads() {
 }
 document.getElementById('downloadsBtn').onclick = openDownloads;
 document.getElementById('clearDownloadsBtn').onclick = () => {
-  window.Bridge.clearDownloads();
+  window.Bridge.clearFinishedDownloads();
   renderDownloads();
-  window.Bridge.toast('已清空下载记录');
+  window.Bridge.toast('已清除完成的下载记录');
 };
 
 function renderDownloads() {
