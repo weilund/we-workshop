@@ -320,8 +320,9 @@ function resetDetailProgress(id) {
   }
 }
 
-async function openDetail(id, hint) {
+async function openDetail(id, hint, fromDownloads) {
   state.detailId = id;
+  state.detailFromDownloads = !!fromDownloads;
   const key = String(id);
   const item = state.items.find((i) => String(i.id) === key) || {};
   const known = state.details[key] || state.details[id] || {};
@@ -360,6 +361,11 @@ async function openDetail(id, hint) {
 function closeDetail() {
   state.detailId = null;
   document.getElementById('detail').classList.add('hidden');
+  // 从下载列表点入的详情，关闭后回到下载列表而不是主界面
+  if (state.detailFromDownloads) {
+    state.detailFromDownloads = false;
+    openDownloads();
+  }
 }
 
 window.__onBack = function () {
@@ -371,6 +377,11 @@ window.__onBack = function () {
   const modal = document.getElementById('detail');
   if (modal && !modal.classList.contains('hidden')) {
     closeDetail();
+    return true;
+  }
+  const dl = document.getElementById('downloads');
+  if (dl && !dl.classList.contains('hidden')) {
+    closeDownloads();
     return true;
   }
   return false;
@@ -643,7 +654,7 @@ function renderDownloads() {
       const id = Number(el.dataset.id);
       if (!id) return;
       closeDownloads();
-      openDetail(id, { title: el.dataset.title, img: el.dataset.img });
+      openDetail(id, { title: el.dataset.title, img: el.dataset.img }, true);
     };
   });
   box.querySelectorAll('.dl-open').forEach(btn => {
