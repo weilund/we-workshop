@@ -55,3 +55,7 @@ sdk.dir=/path/to/android-sdk
 - 仅供个人学习与自用；创意工坊内容版权归原作者所有，请勿二次分发
 - 下载受保护的源文件需要用自己的 Steam 账号登录
 - 本项目与 Valve / Wallpaper Engine 官方无关
+
+---
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
