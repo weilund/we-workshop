@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>WE 工坊</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="safeMask"></div>
+<header id="header">
+  <div class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span>WE 工坊</span>
+    </div>
+    <div class="search-wrap">
+      <svg class="search-icon" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      <input id="search" type="search" placeholder="搜索创意工坊" autocomplete="off">
+    </div>
+    <button id="downloadsBtn" class="icon-btn" title="下载列表">⤓</button>
+    <button id="settingsBtn" class="icon-btn" title="设置">⚙</button>
+  </div>
+  <div class="tabs" id="sortTabs">
+    <button class="tab active" data-sort="trend">趋势</button>
+    <button class="tab" data-sort="mostrecent">最新</button>
+    <button class="tab" data-sort="toprated">最高评分</button>
+  </div>
+  <div class="chips" id="typeChips">
+    <button class="chip active" data-tag="">全部</button>
+    <button class="chip" data-tag="Scene">场景</button>
+    <button class="chip" data-tag="Video">视频</button>
+    <button class="chip" data-tag="Application">应用</button>
+    <button class="chip" data-tag="Web">网页</button>
+  </div>
+  <div class="chips" id="catChips">
+    <button class="chip active" data-cat="">全部类型</button>
+    <button class="chip" data-cat="Wallpaper">壁纸</button>
+    <button class="chip" data-cat="Preset">预设</button>
+    <button class="chip" data-cat="Asset">资源</button>
+  </div>
+  <div class="chips" id="ageChips">
+    <button class="chip active" data-age="">全部分级</button>
+    <button class="chip" data-age="Everyone">所有人</button>
+    <button class="chip" data-age="Questionable">问题内容</button>
+    <button class="chip" data-age="Mature">成人</button>
+  </div>
+</header>
+
+<main id="list"></main>
+<div id="status" class="status"></div>
+
+<div class="pager" id="pager">
+  <button id="prevBtn">上一页</button>
+  <span id="pageInfo">第 1 页 / 共 - 页</span>
+  <button id="nextBtn">下一页</button>
+  <div class="pager-jump">
+    <input id="pageInput" type="number" inputmode="numeric" min="1" placeholder="页码">
+    <button id="jumpBtn">跳转</button>
+  </div>
+</div>
+
+<div id="detail" class="modal hidden">
+  <div class="modal-backdrop" onclick="closeDetail()"></div>
+  <div class="modal-body">
+    <button class="modal-close" onclick="closeDetail()">✕</button>
+    <div class="detail-img-wrap">
+      <img id="detailImg" src="" alt="">
+    </div>
+    <div class="detail-content">
+      <h2 id="detailTitle"></h2>
+      <div id="detailSub" class="detail-sub"></div>
+      <div id="detailTags" class="detail-tags"></div>
+      <div id="detailDesc" class="detail-desc"></div>
+      <div id="dlProgress" class="dl-progress hidden">
+        <div class="dl-bar"><div id="dlBarFill"></div></div>
+        <div id="dlText" class="dl-text"></div>
+      </div>
+      <div class="detail-actions">
+        <button id="openSteamBtn" class="btn-primary">在 Steam 中打开</button>
+        <button id="downloadBtn" class="btn-ghost hidden">下载到手机</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="settings" class="modal hidden">
+  <div class="modal-backdrop" onclick="closeSettings()"></div>
+  <div class="modal-body settings-body">
+    <button class="modal-close" onclick="closeSettings()">✕</button>
+    <h2 class="settings-title">设置</h2>
+    <label class="setting-label" for="proxyInput">网络代理（host:port）</label>
+    <input id="proxyInput" class="setting-input" type="text" inputmode="url"
+           placeholder="如 127.0.0.1:7890，留空=直连" autocomplete="off" spellcheck="false">
+    <p class="setting-hint">手机上开了 VPN / 全局代理时无需填写。仅当系统代理不生效、或想借用电脑代理时使用。</p>
+    <div class="detail-actions">
+      <button id="saveProxyBtn" class="btn-primary">保存并重新加载</button>
+    </div>
+
+    <h2 class="settings-title settings-title-gap">Steam 账号</h2>
+    <div id="steamStatus" class="steam-status">未登录</div>
+    <div id="steamLoggedOut">
+      <input id="steamUser" class="setting-input" type="text" placeholder="Steam 账号" autocomplete="off" spellcheck="false">
+      <input id="steamPass" class="setting-input" type="password" placeholder="密码" autocomplete="off">
+      <div class="detail-actions">
+        <button id="steamLoginBtn" class="btn-primary">登录 Steam</button>
+      </div>
+    </div>
+    <div id="steamLoggedIn" class="hidden">
+      <div class="detail-actions">
+        <button id="steamLogoutBtn" class="btn-ghost">退出登录</button>
+      </div>
+    </div>
+    <div id="steamGuardBox" class="hidden">
+      <p class="setting-hint" id="steamGuardHint">请输入 Steam Guard 验证码</p>
+      <input id="steamGuardInput" class="setting-input" type="text" inputmode="numeric"
+             placeholder="验证码" autocomplete="off">
+      <div class="detail-actions">
+        <button id="steamGuardBtn" class="btn-primary">提交验证码</button>
+      </div>
+    </div>
+    <p class="setting-hint">账号密码仅用于向 Steam 换取登录令牌，令牌保存在本机，不会上传到其他服务器。</p>
+  </div>
+</div>
+
+<div id="downloads" class="modal hidden">
+  <div class="modal-backdrop" onclick="closeDownloads()"></div>
+  <div class="modal-body settings-body">
+    <button class="modal-close" onclick="closeDownloads()">✕</button>
+    <h2 class="settings-title">下载列表</h2>
+    <div id="downloadItems" class="download-list"></div>
+    <div class="detail-actions">
+      <button id="clearDownloadsBtn" class="btn-ghost">清空记录</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
