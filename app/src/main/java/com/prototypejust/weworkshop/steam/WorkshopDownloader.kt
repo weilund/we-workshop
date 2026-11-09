@@ -100,6 +100,28 @@ object WorkshopDownloader {
         }
     }
 
+    /** 所有活跃下载的最新进度（JSON map），供 App 回到前台/打开列表时同步 */
+    @JvmStatic
+    fun activeProgressJson(): String {
+        val sb = StringBuilder("{")
+        var first = true
+        for (id in activeItems) {
+            val p = lastProgress[id] ?: continue
+            if (!first) sb.append(',')
+            first = false
+            sb.append('"').append(id).append("\":")
+            sb.append("{\"itemId\":").append(p.itemId)
+            sb.append(",\"received\":").append(p.received)
+            sb.append(",\"total\":").append(p.total)
+            sb.append(",\"phase\":\"").append(jsonEscape(p.phase)).append('"')
+            sb.append(",\"done\":").append(p.done)
+            val err = p.error
+            sb.append(",\"error\":").append(if (err == null) "null" else "\"" + jsonEscape(err) + "\"")
+            sb.append('}')
+        }
+        return sb.append('}').toString()
+    }
+
     private fun jsonEscape(s: String): String =
         s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ").replace("\r", " ")
 

@@ -108,6 +108,16 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // App 回到前台时，WebView 在后台可能收不到进度回调，主动同步一次
+        if (webView != null) {
+            webView.post(() -> webView.evaluateJavascript(
+                    "window.__syncDownloads && window.__syncDownloads();", null));
+        }
+    }
+
+    @Override
     public void onBackPressed() {
         webView.evaluateJavascript("(window.__onBack && window.__onBack()) ? 1 : 0", value -> {
             if (!"1".equals(value)) {

@@ -183,6 +183,12 @@ public class Bridge {
     }
 
     /** 某个条目是否还有下载任务在跑。 */
+    /** 所有活跃下载的最新进度（JSON map），用于 WebView 暂停/重建后同步 */
+    @JavascriptInterface
+    public String activeProgress() {
+        return WorkshopDownloader.activeProgressJson();
+    }
+
     @JavascriptInterface
     public boolean isDownloading(String itemId) {
         try {

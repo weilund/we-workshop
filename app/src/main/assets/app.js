@@ -333,7 +333,7 @@ async function openDetail(id, hint, fromDownloads) {
   }, known));
   // WebView 重建（切后台被回收等）后内存里可能没有进度记录，
   // 此时从原生下载器恢复一次，避免「列表在下载但详情页没有进度条」。
-  if (!state.downloads[key] && window.Bridge.downloadState) {
+  if (window.Bridge.downloadState) {
     try {
       const raw = window.Bridge.downloadState(key);
       if (raw) {
@@ -584,7 +584,30 @@ function escHtml(s) {
   }[ch]));
 }
 
+function syncActiveDownloads() {
+  try {
+    if (!window.Bridge.activeProgress) return;
+    const map = JSON.parse(window.Bridge.activeProgress() || '{}');
+    Object.keys(map).forEach(k => { if (map[k]) state.downloads[k] = map[k]; });
+  } catch (e) { /* ignore */ }
+}
+
+window.__syncDownloads = function () {
+  syncActiveDownloads();
+  try {
+    const dlg = document.getElementById('downloads');
+    if (dlg && !dlg.classList.contains('hidden')) renderDownloads();
+    const detail = document.getElementById('detail');
+    if (state.detailId != null && detail && !detail.classList.contains('hidden')) {
+      const p = state.downloads[String(state.detailId)];
+      if (p) renderDetailProgress(p);
+    }
+  } catch (e) { /* ignore */ }
+  return true;
+};
+
 function openDownloads() {
+  syncActiveDownloads();
   renderDownloads();
   document.getElementById('downloads').classList.remove('hidden');
 }
