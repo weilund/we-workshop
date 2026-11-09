@@ -292,7 +292,10 @@ function fillDetail(d) {
 
   const dl = document.getElementById('downloadBtn');
   dl.classList.remove('hidden');
-  dl.textContent = d.file_size ? '下载到手机（' + fmtSize(d.file_size) + '）' : '下载到手机';
+  const dp = state.downloads[String(d.id || '')];
+  const downloading = dp && !dp.done && !dp.error;
+  dl.textContent = downloading ? '下载中…'
+    : (d.file_size ? '下载到手机（' + fmtSize(d.file_size) + '）' : '下载到手机');
   dl.onclick = () => startDownload(d);
   document.getElementById('detail').dataset.itemId = String(d.id || '');
   document.getElementById('openSteamBtn').onclick = () => {
@@ -322,7 +325,7 @@ function resetDetailProgress(id) {
   const box = document.getElementById('dlProgress');
   if (!box) return;
   const p = state.downloads[String(id)];
-  if (p && !p.done && !p.error) {
+  if (p) {
     renderDetailProgress(p);
   } else {
     box.classList.add('hidden');
@@ -334,6 +337,7 @@ function resetDetailProgress(id) {
 async function openDetail(id, hint, fromDownloads) {
   state.detailId = id;
   state.detailFromDownloads = !!fromDownloads;
+  syncActiveDownloads();
   const key = String(id);
   const item = state.items.find((i) => String(i.id) === key) || {};
   const known = state.details[key] || state.details[id] || {};
@@ -777,6 +781,25 @@ window.__downloadProgress = function (p) {
   renderDetailProgress(p);
   if (p.done) window.Bridge.toast('下载完成，已保存到 Download/Wallpaper WE/');
 };
+
+/* 前台定时同步：WebView 回调偶尔丢失时也能追上原生下载进度 */
+setInterval(function () {
+  try {
+    const dl = document.getElementById('downloads');
+    const detail = document.getElementById('detail');
+    const dlOpen = dl && !dl.classList.contains('hidden');
+    const detailOpen = state.detailId != null && detail && !detail.classList.contains('hidden');
+    if (!dlOpen && !detailOpen) return;
+    const before = JSON.stringify(state.downloads);
+    syncActiveDownloads();
+    if (JSON.stringify(state.downloads) === before) return;
+    if (dlOpen) renderDownloads();
+    if (detailOpen) {
+      const p = state.downloads[String(state.detailId)];
+      if (p) renderDetailProgress(p);
+    }
+  } catch (e) { /* ignore */ }
+}, 1000);
 
 restoreFilters();
 applyFilterUI();

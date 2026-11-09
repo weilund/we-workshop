@@ -114,6 +114,9 @@ public class MainActivity extends Activity {
         if (webView != null) {
             webView.post(() -> webView.evaluateJavascript(
                     "window.__syncDownloads && window.__syncDownloads();", null));
+            // WebView 从后台恢复可能要几百毫秒，再补一次
+            webView.postDelayed(() -> webView.evaluateJavascript(
+                    "window.__syncDownloads && window.__syncDownloads();", null), 600);
         }
     }
 
