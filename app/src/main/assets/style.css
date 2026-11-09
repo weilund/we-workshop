@@ -10,6 +10,8 @@
 
 html {
   background: #0e0f13;
+  /* 关闭 Chrome 滚动锚定，否则翻页换内容时会把滚动位置拉回去 */
+  overflow-anchor: none;
 }
 
 body {

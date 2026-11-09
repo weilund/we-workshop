@@ -214,6 +214,14 @@ function render() {
   if (pageInput) pageInput.max = String(totalPages || MAX_PAGE);
 }
 
+function scrollToTop() {
+  try {
+    window.scrollTo(0, 0);
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+  } catch (e) { /* ignore */ }
+}
+
 async function loadPage() {
   if (state.loading) return;
   state.loading = true;
@@ -252,6 +260,9 @@ async function loadPage() {
       render();
     }
   }
+  // 翻页/搜索/筛选后回到顶部；渲染完成后补一次，避免滚动锚定把位置拉回
+  scrollToTop();
+  setTimeout(scrollToTop, 60);
 }
 
 function fillDetail(d) {
