@@ -36,9 +36,21 @@ public class Bridge {
         SteamService.init(activity);
     }
 
+    private boolean resumeInterruptedTriggered = false;
+
     private void pushSteamState() {
         final String js = "window.__steamState && window.__steamState(" + SteamService.stateJson() + ")";
         main.post(() -> webView.evaluateJavascript(js, null));
+        // 登录恢复完成后，把进程被杀时中断的下载重新拉起来（只触发一次）
+        if (!resumeInterruptedTriggered && SteamService.INSTANCE.isLoggedIn()) {
+            resumeInterruptedTriggered = true;
+            pool.execute(() -> {
+                try {
+                    WorkshopDownloader.resumeInterrupted(activity);
+                } catch (Throwable ignored) {
+                }
+            });
+        }
     }
 
     private void pushSteamGuard() {

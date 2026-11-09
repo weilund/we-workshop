@@ -6,6 +6,8 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+
+import com.prototypejust.weworkshop.DownloadService
 import com.prototypejust.weworkshop.DownloadStore
 import `in`.dragonbra.javasteam.enums.EDepotFileFlag
 import `in`.dragonbra.javasteam.enums.EResult
@@ -186,6 +188,8 @@ object WorkshopDownloader {
         }
         cancelledItems.remove(itemId)
         manifests[itemId] = manifestId
+        // 下载期间启用前台服务，避免切后台后进程被系统回收
+        DownloadService.start(context.applicationContext)
         val job = CoroutineScope(Dispatchers.IO).launch {
             var attempt = 0
             try {
@@ -233,10 +237,38 @@ object WorkshopDownloader {
             } finally {
                 activeItems.remove(itemId)
                 jobs.remove(itemId)
+                if (activeItems.isEmpty()) {
+                    DownloadService.stop(context.applicationContext)
+                }
             }
         }
         jobs[itemId] = job
         if (job.isCompleted) jobs.remove(itemId)
+    }
+
+    /**
+     * 进程被杀（后台回收）后重新进入 App 时调用：
+     * 找 DownloadStore 里仍标记为「下载中」、但当前没有协程在跑的任务，重新起下载（走断点续传）。
+     */
+    @JvmStatic
+    fun resumeInterrupted(context: Context) {
+        val ctx = context.applicationContext
+        try {
+            DownloadStore.init(ctx)
+            val arr = DownloadStore.list()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (o.optString("status") != "downloading") continue
+                val id = o.optLong("id", 0L)
+                if (id <= 0L || isActive(id)) continue
+                val manifest = o.optString("manifest", "").toLongOrNull() ?: 0L
+                if (manifest <= 0L) continue
+                logFile(ctx, "resume interrupted item=$id manifest=$manifest")
+                downloadAsync(ctx, id, manifest, o.optString("title"), o.optString("img"))
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "resumeInterrupted failed", t)
+        }
     }
 
     private suspend fun download(context: Context, itemId: Long, manifestId: Long) {
