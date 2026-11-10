@@ -51,6 +51,7 @@ object WorkshopDownloader {
     private const val CDN_CANDIDATE_LIMIT = 20
 
     /** 下载失败自动重试：最多 3 次，间隔 3s / 6s / 12s（断点续传会从已下载处继续） */
+    private const val MAX_CONCURRENT_TASKS = 2
     private const val AUTO_RETRY_MAX = 3
     private const val AUTO_RETRY_BASE_DELAY_MS = 3000L
     private val VIDEO_EXTS = setOf("mp4", "webm", "mov", "mkv", "avi", "m4v", "wmv")
@@ -77,6 +78,10 @@ object WorkshopDownloader {
     private val titles = java.util.concurrent.ConcurrentHashMap<Long, String>()
     private val images = java.util.concurrent.ConcurrentHashMap<Long, String>()
     private val activeItems = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    /** 同时真正下载的任务数上限。进程被杀重启后可能一次性恢复十几个任务，
+     *  每个任务再开 4 路并行，全部同时跑会把内存和 CDN 连接打爆，这里排队限流。 */
+    private val downloadSlots = kotlinx.coroutines.sync.Semaphore(MAX_CONCURRENT_TASKS)
     private val manifests = java.util.concurrent.ConcurrentHashMap<Long, Long>()
     private val cancelledItems = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
     private val jobs = ConcurrentHashMap<Long, Job>()
@@ -194,46 +199,59 @@ object WorkshopDownloader {
         val job = CoroutineScope(Dispatchers.IO).launch {
             var attempt = 0
             try {
-                while (true) {
-                    try {
-                        download(context.applicationContext, itemId, manifestId)
-                        return@launch
-                    } catch (t: Throwable) {
-                        val cancelled = t is kotlinx.coroutines.CancellationException || isCancelled(itemId)
-                        Log.e(TAG, "download failed for $itemId (attempt ${attempt + 1})", t)
-                        logFile(context, "FAIL item=$itemId manifest=$manifestId attempt=${attempt + 1}: ${t.message}")
-                        if (cancelled) {
-                            val cur = lastProgress[itemId]
-                            emit(Progress(itemId, cur?.received ?: 0L, cur?.total ?: 0L, "已取消", error = "已取消"))
+                val queued = lastProgress[itemId]
+                emit(Progress(itemId, queued?.received ?: 0L, queued?.total ?: 0L, "排队中…"))
+                downloadSlots.acquire()
+                try {
+                    while (true) {
+                        try {
+                            download(context.applicationContext, itemId, manifestId)
                             return@launch
-                        }
-                        attempt++
-                        val lp = lastProgress[itemId]
-                        if (attempt > AUTO_RETRY_MAX) {
+                        } catch (t: Throwable) {
+                            val cancelled = t is kotlinx.coroutines.CancellationException || isCancelled(itemId)
+                            Log.e(TAG, "download failed for $itemId (attempt ${attempt + 1})", t)
+                            logFile(context, "FAIL item=$itemId manifest=$manifestId attempt=${attempt + 1}: ${t.message}")
+                            if (cancelled) {
+                                val cur = lastProgress[itemId]
+                                emit(Progress(itemId, cur?.received ?: 0L, cur?.total ?: 0L, "已取消", error = "已取消"))
+                                return@launch
+                            }
+                            attempt++
+                            val lp = lastProgress[itemId]
+                            if (attempt > AUTO_RETRY_MAX) {
+                                emit(
+                                    Progress(
+                                        itemId, lp?.received ?: 0L, lp?.total ?: 0L, "失败",
+                                        error = (t.message ?: "下载失败") + "（已自动重试 $AUTO_RETRY_MAX 次）"
+                                    )
+                                )
+                                return@launch
+                            }
+                            val delayMs = AUTO_RETRY_BASE_DELAY_MS * (1L shl (attempt - 1))
+                            val sec = (delayMs / 1000L).coerceAtLeast(1L)
+                            logFile(context, "auto retry $attempt/$AUTO_RETRY_MAX for item=$itemId in ${delayMs}ms")
                             emit(
                                 Progress(
-                                    itemId, lp?.received ?: 0L, lp?.total ?: 0L, "失败",
-                                    error = (t.message ?: "下载失败") + "（已自动重试 $AUTO_RETRY_MAX 次）"
+                                    itemId, lp?.received ?: 0L, lp?.total ?: 0L,
+                                    "自动重试 $attempt/$AUTO_RETRY_MAX（${sec} 秒后）"
                                 )
                             )
-                            return@launch
-                        }
-                        val delayMs = AUTO_RETRY_BASE_DELAY_MS * (1L shl (attempt - 1))
-                        val sec = (delayMs / 1000L).coerceAtLeast(1L)
-                        logFile(context, "auto retry $attempt/$AUTO_RETRY_MAX for item=$itemId in ${delayMs}ms")
-                        emit(
-                            Progress(
-                                itemId, lp?.received ?: 0L, lp?.total ?: 0L,
-                                "自动重试 $attempt/$AUTO_RETRY_MAX（${sec} 秒后）"
-                            )
-                        )
-                        delay(delayMs)
-                        if (isCancelled(itemId)) {
-                            val cur = lastProgress[itemId]
-                            emit(Progress(itemId, cur?.received ?: 0L, cur?.total ?: 0L, "已取消", error = "已取消"))
-                            return@launch
+                            delay(delayMs)
+                            if (isCancelled(itemId)) {
+                                val cur = lastProgress[itemId]
+                                emit(Progress(itemId, cur?.received ?: 0L, cur?.total ?: 0L, "已取消", error = "已取消"))
+                                return@launch
+                            }
                         }
                     }
+                } finally {
+                    downloadSlots.release()
+                }
+            } catch (t: Throwable) {
+                // 还在排队就被取消时，while 里的 catch 走不到，这里兜底
+                if (t is kotlinx.coroutines.CancellationException || isCancelled(itemId)) {
+                    val cur = lastProgress[itemId]
+                    emit(Progress(itemId, cur?.received ?: 0L, cur?.total ?: 0L, "已取消", error = "已取消"))
                 }
             } finally {
                 activeItems.remove(itemId)
@@ -539,6 +557,16 @@ object WorkshopDownloader {
                 pending.clear()
             }
         }
+    }
+
+    /** 记录未捕获异常（App 闪退时写进 weworkshop.log，供下次排查）。 */
+    @JvmStatic
+    fun logCrash(context: Context?, t: Throwable) {
+        val sw = java.io.StringWriter()
+        t.printStackTrace(java.io.PrintWriter(sw))
+        val msg = "CRASH: " + sw.toString().take(6000)
+        Log.e(TAG, msg)
+        if (context != null) logFile(context, msg)
     }
 
     private fun checkCancelled(itemId: Long) {

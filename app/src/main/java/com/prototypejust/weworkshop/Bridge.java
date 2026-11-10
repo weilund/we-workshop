@@ -212,6 +212,14 @@ public class Bridge {
 
     /** 取消指定条目的下载（下载列表里的「取消」按钮）。 */
     @JavascriptInterface
+    public void cancelAllDownloads() {
+        try {
+            WorkshopDownloader.cancel();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @JavascriptInterface
     public void cancelDownloadById(String itemId) {
         try {
             WorkshopDownloader.cancel(Long.parseLong(itemId));

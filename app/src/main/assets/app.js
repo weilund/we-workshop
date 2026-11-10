@@ -630,6 +630,11 @@ function closeDownloads() {
   document.getElementById('downloads').classList.add('hidden');
 }
 document.getElementById('downloadsBtn').onclick = openDownloads;
+document.getElementById('cancelAllBtn').onclick = () => {
+  window.Bridge.cancelAllDownloads();
+  window.Bridge.toast('已取消所有下载');
+};
+
 document.getElementById('clearDownloadsBtn').onclick = () => {
   window.Bridge.clearFinishedDownloads();
   renderDownloads();

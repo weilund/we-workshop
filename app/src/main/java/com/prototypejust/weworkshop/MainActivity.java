@@ -10,6 +10,8 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import com.prototypejust.weworkshop.steam.WorkshopDownloader;
+
 /**
  * 单 Activity + WebView。
  *
@@ -61,6 +63,19 @@ public class MainActivity extends Activity {
         });
         Bridge bridge = new Bridge(this, webView);
         webView.addJavascriptInterface(bridge, "Bridge");
+
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            try {
+                WorkshopDownloader.logCrash(getApplicationContext(), throwable);
+            } catch (Throwable ignored) {
+            }
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException ignored) {
+            }
+            android.os.Process.killProcess(android.os.Process.myPid());
+            System.exit(10);
+        });
         Bridge.applySavedProxy(this);
         bridge.initSteam();
 
