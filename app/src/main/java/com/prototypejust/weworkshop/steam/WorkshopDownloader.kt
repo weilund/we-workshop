@@ -16,6 +16,7 @@ import `in`.dragonbra.javasteam.steam.cdn.DepotChunk
 import `in`.dragonbra.javasteam.steam.cdn.Server
 import `in`.dragonbra.javasteam.types.ChunkData
 import `in`.dragonbra.javasteam.types.DepotManifest
+import `in`.dragonbra.javasteam.types.FileData
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
@@ -378,15 +379,25 @@ object WorkshopDownloader {
         // 断点续传：保留上次未完成的 staging（同一 manifest 指纹才复用）
         val staging = File(context.cacheDir, "workshop/$itemId")
         val metaFile = File(staging, ".meta")
+        val chunksLog = File(staging, ".chunks")
         val fingerprint = manifestId.toString() + "|" + filesToDownload.joinToString("|") { it.fileName + ":" + it.totalSize }
         val resumeExisting = staging.exists() && metaFile.exists() &&
             runCatching { metaFile.readText() }.getOrNull() == fingerprint
         if (!resumeExisting) staging.deleteRecursively()
         staging.mkdirs()
         metaFile.writeText(fingerprint)
+        // 不能只看文件长度判断续传：多路并行时文件尾部可能先写满，长度变大但中间是空洞，
+        // 只按长度跳过会把空洞当成已完成，播出来就是花屏。所以逐 chunk 记录完成情况。
+        val done = java.util.Collections.synchronizedSet(HashSet<String>())
+        if (resumeExisting && chunksLog.exists()) {
+            runCatching {
+                chunksLog.forEachLine { line -> if (line.isNotBlank()) done.add(line.trim()) }
+            }
+        }
+        val journal = ChunkJournal(chunksLog)
         val existingBytes = filesToDownload.sumOf { f ->
-            val f2 = File(staging, sanitizePath(f.fileName))
-            if (f2.exists()) minOf(f2.length(), f.totalSize) else 0L
+            f.chunks.filter { done.contains(f.fileName + "|" + it.offset) }
+                .sumOf { it.uncompressedLength.toLong() }
         }
         if (existingBytes > 0L) {
             val rl = "resume: existing=$existingBytes/$totalBytes for $itemId"
@@ -405,12 +416,15 @@ object WorkshopDownloader {
             val outFile = File(staging, sanitizePath(file.fileName))
             outFile.parentFile?.mkdirs()
 
-            val existingLen = if (outFile.exists()) outFile.length() else 0L
+            val fileExists = outFile.exists() && outFile.length() > 0L
             val pending = file.chunks.sortedBy { it.offset }.filterNot { chunk ->
-                // 已完整写入的 chunk 跳过（续传）
-                existingLen > 0L && chunk.offset + chunk.uncompressedLength.toLong() <= existingLen
+                // 只跳过明确记录为已完成的 chunk（续传）；文件不存在时全部重下
+                fileExists && done.contains(file.fileName + "|" + chunk.offset)
             }
-            if (pending.isEmpty()) continue
+            if (pending.isEmpty()) {
+                verifyOrThrow(file, outFile, staging, journal)
+                continue
+            }
 
             val counter = AtomicLong(downloadedNow)
             val speedStartMs = System.currentTimeMillis()
@@ -446,6 +460,7 @@ object WorkshopDownloader {
                                 val written = DepotChunk.process(chunk, encrypted, plain, depotKey)
                                 raf.seek(chunk.offset)
                                 raf.write(plain, 0, written)
+                                journal.add(file.fileName + "|" + chunk.offset)
                                 val total = counter.addAndGet(written.toLong())
                                 val now = System.currentTimeMillis()
                                 // 节流：最多每 250ms 刷新一次界面 & 落盘，避免频繁回调造成卡顿
@@ -461,15 +476,69 @@ object WorkshopDownloader {
                     }
                 }.forEach { it.join() }
             }
+            verifyOrThrow(file, outFile, staging, journal)
             downloadedNow = counter.get()
         }
         received = downloadedNow
 
+        journal.flush()
         emit(Progress(itemId, received, totalBytes, "保存到 Download…"))
         val target = copyToDownloads(context, itemId, staging)
         staging.deleteRecursively()
         Log.i(TAG, "saved to $target")
         emit(Progress(itemId, received, totalBytes, "已保存：$target", done = true))
+    }
+
+    /** manifest 自带每个文件的 SHA-1；不匹配说明数据坏了，清掉 staging 重新下载。 */
+    private fun verifyOrThrow(file: FileData, outFile: File, staging: File, journal: ChunkJournal) {
+        if (outFile.length() != file.totalSize) {
+            staging.deleteRecursively()
+            throw IllegalStateException(
+                "文件大小不符（${outFile.length()}/${file.totalSize}），将重新下载：${file.fileName}"
+            )
+        }
+        val expected = file.fileHash ?: return
+        if (expected.isEmpty()) return
+        journal.flush()
+        if (!sha1Of(outFile).contentEquals(expected)) {
+            staging.deleteRecursively()
+            throw IllegalStateException("文件校验失败（数据损坏），将重新下载：${file.fileName}")
+        }
+    }
+
+    private fun sha1Of(file: File): ByteArray {
+        val md = java.security.MessageDigest.getInstance("SHA-1")
+        java.io.FileInputStream(file).use { ins ->
+            val buf = ByteArray(1 shl 16)
+            while (true) {
+                val n = ins.read(buf)
+                if (n <= 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest()
+    }
+
+    /** 已完成 chunk 的追加日志：每行「文件名|offset」，攒批落盘，丢失最多重下少量分块。 */
+    private class ChunkJournal(private val file: File) {
+        private val pending = ArrayList<String>()
+
+        @Synchronized
+        fun add(key: String) {
+            pending.add(key)
+            if (pending.size >= 200) flush()
+        }
+
+        @Synchronized
+        fun flush() {
+            if (pending.isEmpty()) return
+            try {
+                file.appendText(pending.joinToString("") { "$it\n" })
+                pending.clear()
+            } catch (_: Throwable) {
+                pending.clear()
+            }
+        }
     }
 
     private fun checkCancelled(itemId: Long) {
@@ -489,7 +558,7 @@ object WorkshopDownloader {
     /** 复制到 Download/Wallpaper WE/ 根目录（视频直接平铺，不再建编号子文件夹） */
     private fun copyToDownloads(context: Context, itemId: Long, staging: File): String {
         val baseRel = "Download/Wallpaper WE"
-        val files = staging.walkTopDown().filter { it.isFile && it.name != ".meta" }.toList()
+        val files = staging.walkTopDown().filter { it.isFile && it.name != ".meta" && it.name != ".chunks" }.toList()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val resolver = context.contentResolver
             files.forEach { f ->
