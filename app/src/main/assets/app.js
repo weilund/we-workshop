@@ -17,9 +17,9 @@ const MAX_PAGE = 1000;
 
 const state = {
   sort: 'trend',
-  typeTag: '',
-  catTag: '',
-  ageTag: '',
+  typeTags: [],
+  catTags: [],
+  ageTags: [],
   search: '',
   page: 1,
   total: 0,
@@ -36,8 +36,8 @@ const FILTER_KEY = 'we_filters';
 function saveFilters() {
   try {
     localStorage.setItem(FILTER_KEY, JSON.stringify({
-      sort: state.sort, typeTag: state.typeTag, catTag: state.catTag,
-      ageTag: state.ageTag, search: state.search,
+      sort: state.sort, typeTags: state.typeTags, catTags: state.catTags,
+      ageTags: state.ageTags, search: state.search,
     }));
   } catch (e) { /* ignore */ }
 }
@@ -47,9 +47,11 @@ function restoreFilters() {
     const f = JSON.parse(localStorage.getItem(FILTER_KEY) || 'null');
     if (!f) return;
     if (f.sort) state.sort = f.sort;
-    if (typeof f.typeTag === 'string') state.typeTag = f.typeTag;
-    if (typeof f.catTag === 'string') state.catTag = f.catTag;
-    if (typeof f.ageTag === 'string') state.ageTag = f.ageTag;
+    // 兼容旧版本（单选字符串）与新版（数组）
+    const norm = (v) => (Array.isArray(v) ? v.filter(Boolean) : (typeof v === 'string' && v ? [v] : []));
+    state.typeTags = norm(f.typeTags !== undefined ? f.typeTags : f.typeTag);
+    state.catTags = norm(f.catTags !== undefined ? f.catTags : f.catTag);
+    state.ageTags = norm(f.ageTags !== undefined ? f.ageTags : f.ageTag);
     if (typeof f.search === 'string') state.search = f.search;
   } catch (e) { /* ignore */ }
 }
@@ -58,11 +60,12 @@ function applyFilterUI() {
   document.querySelectorAll('#sortTabs .tab').forEach((b) => {
     b.classList.toggle('active', b.dataset.sort === state.sort);
   });
-  [['typeChips', 'tag', state.typeTag],
-   ['catChips', 'cat', state.catTag],
-   ['ageChips', 'age', state.ageTag]].forEach((row) => {
+  [['typeChips', 'tag', state.typeTags],
+   ['catChips', 'cat', state.catTags],
+   ['ageChips', 'age', state.ageTags]].forEach((row) => {
     document.querySelectorAll('#' + row[0] + ' .chip').forEach((b) => {
-      b.classList.toggle('active', (b.dataset[row[1]] || '') === (row[2] || ''));
+      const v = b.dataset[row[1]] || '';
+      b.classList.toggle('active', v === '' ? row[2].length === 0 : row[2].includes(v));
     });
   });
   const s = document.getElementById('search');
@@ -96,9 +99,9 @@ function callBridge(method, ...args) {
 function buildQuery() {
   const parts = ['appid=' + APPID, 'section=readonly', 'browsesort=' + encodeURIComponent(state.sort),
     'num_per_page=' + PAGE_SIZE, 'p=' + state.page];
-  if (state.typeTag) parts.push('requiredtags%5B%5D=' + encodeURIComponent(state.typeTag));
-  if (state.catTag) parts.push('requiredtags%5B%5D=' + encodeURIComponent(state.catTag));
-  if (state.ageTag) parts.push('requiredtags%5B%5D=' + encodeURIComponent(state.ageTag));
+  state.typeTags.concat(state.catTags, state.ageTags).forEach((t) => {
+    parts.push('requiredtags%5B%5D=' + encodeURIComponent(t));
+  });
   const q = state.search.trim();
   if (q) parts.push('searchtext=' + encodeURIComponent(q));
   return parts.join('&');
@@ -109,7 +112,7 @@ const QUERY_TYPE = { trend: 3, mostrecent: 1, toprated: 0 };
 
 /* 登录后走 Steam 客户端 API（与 WE 客户端数据源一致），未登录时回退网页抓取 */
 function buildOnlineQuery() {
-  const tags = [state.typeTag, state.catTag, state.ageTag].filter(Boolean);
+  const tags = state.typeTags.concat(state.catTags, state.ageTags);
   return JSON.stringify({
     queryType: QUERY_TYPE[state.sort] !== undefined ? QUERY_TYPE[state.sort] : 3,
     page: state.page,
@@ -250,7 +253,8 @@ async function loadPage() {
   if (hasFull) {
     state.items.forEach((it) => { state.details[String(it.id)] = it; });
   }
-  setStatus(state.items.length ? '' : '没有找到内容');
+  const tagCount = state.typeTags.length + state.catTags.length + state.ageTags.length;
+  setStatus(state.items.length ? '' : (tagCount > 1 ? '没有找到同时满足所有已选标签的内容，试试减少标签' : '没有找到内容'));
   render();
   if (!hasFull && state.items.length) {
     const ids = state.items.map((i) => i.id).join(',');
@@ -414,38 +418,29 @@ document.getElementById('sortTabs').addEventListener('click', (e) => {
   loadPage();
 });
 
-document.getElementById('typeChips').addEventListener('click', (e) => {
-  const btn = e.target.closest('.chip');
-  if (!btn) return;
-  document.querySelectorAll('#typeChips .chip').forEach((b) => b.classList.remove('active'));
-  btn.classList.add('active');
-  state.typeTag = btn.dataset.tag;
-  state.page = 1;
-  saveFilters();
-  loadPage();
-});
+/* 标签组多选：点「全部/全部类型/全部分级」清空，其余项可同时勾选 */
+function bindChipGroup(id, stateKey, dataKey) {
+  document.getElementById(id).addEventListener('click', (e) => {
+    const btn = e.target.closest('.chip');
+    if (!btn) return;
+    const v = btn.dataset[dataKey] || '';
+    const arr = state[stateKey];
+    if (v === '') {
+      arr.length = 0;
+    } else {
+      const i = arr.indexOf(v);
+      if (i >= 0) arr.splice(i, 1); else arr.push(v);
+    }
+    state.page = 1;
+    applyFilterUI();
+    saveFilters();
+    loadPage();
+  });
+}
 
-document.getElementById('ageChips').addEventListener('click', (e) => {
-  const btn = e.target.closest('.chip');
-  if (!btn) return;
-  document.querySelectorAll('#ageChips .chip').forEach((b) => b.classList.remove('active'));
-  btn.classList.add('active');
-  state.ageTag = btn.dataset.age;
-  state.page = 1;
-  saveFilters();
-  loadPage();
-});
-
-document.getElementById('catChips').addEventListener('click', (e) => {
-  const btn = e.target.closest('.chip');
-  if (!btn) return;
-  document.querySelectorAll('#catChips .chip').forEach((b) => b.classList.remove('active'));
-  btn.classList.add('active');
-  state.catTag = btn.dataset.cat;
-  state.page = 1;
-  saveFilters();
-  loadPage();
-});
+bindChipGroup('typeChips', 'typeTags', 'tag');
+bindChipGroup('catChips', 'catTags', 'cat');
+bindChipGroup('ageChips', 'ageTags', 'age');
 
 let searchTimer = null;
 document.getElementById('search').addEventListener('input', (e) => {
