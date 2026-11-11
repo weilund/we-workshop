@@ -354,7 +354,8 @@ object SteamService {
             .setReturnShortDescription(true)
             .setReturnVoteData(true)
             .setReturnMetadata(true)
-            .setMatchAllTags(true)
+            // 多选标签取并集（OR）：命中任意一个标签即可，符合用户期望的『并集』语义
+            .setMatchAllTags(false)
         for (i in 0 until tagsJson.length()) {
             val t = tagsJson.optString(i, "")
             if (t.isNotBlank()) builder.addRequiredtags(t)
