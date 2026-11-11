@@ -355,7 +355,7 @@ object SteamService {
             .setReturnVoteData(true)
             .setReturnMetadata(true)
             // 多选标签取并集（OR）：命中任意一个标签即可，符合用户期望的『并集』语义
-            .setMatchAllTags(false)
+            .setMatchAllTags(true)
         for (i in 0 until tagsJson.length()) {
             val t = tagsJson.optString(i, "")
             if (t.isNotBlank()) builder.addRequiredtags(t)

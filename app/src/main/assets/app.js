@@ -96,10 +96,11 @@ function callBridge(method, ...args) {
   });
 }
 
-function buildQuery() {
+function buildQuery(tags) {
+  const useTags = tags || state.typeTags.concat(state.catTags, state.ageTags);
   const parts = ['appid=' + APPID, 'section=readonly', 'browsesort=' + encodeURIComponent(state.sort),
     'num_per_page=' + PAGE_SIZE, 'p=' + state.page];
-  state.typeTags.concat(state.catTags, state.ageTags).forEach((t) => {
+  useTags.forEach((t) => {
     parts.push('requiredtags%5B%5D=' + encodeURIComponent(t));
   });
   const q = state.search.trim();
@@ -111,13 +112,13 @@ function buildQuery() {
 const QUERY_TYPE = { trend: 3, mostrecent: 1, toprated: 0 };
 
 /* 登录后走 Steam 客户端 API（与 WE 客户端数据源一致），未登录时回退网页抓取 */
-function buildOnlineQuery() {
-  const tags = state.typeTags.concat(state.catTags, state.ageTags);
+function buildOnlineQuery(tags) {
+  const useTags = tags || state.typeTags.concat(state.catTags, state.ageTags);
   return JSON.stringify({
     queryType: QUERY_TYPE[state.sort] !== undefined ? QUERY_TYPE[state.sort] : 3,
     page: state.page,
     numPerPage: PAGE_SIZE,
-    tags: tags,
+    tags: useTags,
     search: state.search.trim(),
   });
 }
@@ -225,20 +226,83 @@ function scrollToTop() {
   } catch (e) { /* ignore */ }
 }
 
+/* 组内并集、组间交集：
+   每组取一个标签组成一个查询（组内多选拆成多次查询再合并），组与组之间仍是 AND */
+function groupOptions(id, dataKey) {
+  return Array.from(document.querySelectorAll('#' + id + ' .chip'))
+    .map((b) => b.dataset[dataKey] || '').filter((v) => v !== '');
+}
+
+function buildTagCombos() {
+  // 某组全选 = 该组不限制，折叠成空以压缩查询组合数
+  const allTypes = groupOptions('typeChips', 'tag');
+  const allCats = groupOptions('catChips', 'cat');
+  const allAges = groupOptions('ageChips', 'age');
+  const ts = (state.typeTags.length && state.typeTags.length < allTypes.length) ? state.typeTags : [''];
+  const cs = (state.catTags.length && state.catTags.length < allCats.length) ? state.catTags : [''];
+  const as = (state.ageTags.length && state.ageTags.length < allAges.length) ? state.ageTags : [''];
+  const out = [];
+  ts.forEach((t) => cs.forEach((c) => as.forEach((a) => {
+    out.push([t, c, a].filter(Boolean));
+  })));
+  return out;
+}
+
+
+const MAX_TAG_COMBOS = 6;
+
+/* 合并多次查询结果：交错排列保留各自排序，按 id 去重，total 累加 */
+function mergeResults(list) {
+  const ok = list.filter((x) => x && x.ok);
+  if (!ok.length) return (list && list[0]) || { ok: false, error: '未知错误' };
+  const lists = ok.map((x) => x.items || []);
+  const seen = new Set();
+  const items = [];
+  const maxLen = lists.reduce((m, l) => Math.max(m, l.length), 0);
+  for (let i = 0; i < maxLen; i++) {
+    for (let j = 0; j < lists.length; j++) {
+      const l = lists[j];
+      if (i < l.length) {
+        const it = l[i];
+        const k = String(it.id);
+        if (!seen.has(k)) { seen.add(k); items.push(it); }
+      }
+    }
+  }
+  const total = ok.reduce((s2, x) => s2 + (Number(x.total) || 0), 0);
+  return { ok: true, items: items, total: total };
+}
+
 async function loadPage() {
   if (state.loading) return;
   state.loading = true;
   setStatus('加载中…');
   document.getElementById('list').innerHTML = '';
+  const combos = buildTagCombos();
+  if (combos.length > MAX_TAG_COMBOS) {
+    state.loading = false;
+    setStatus('标签组合太多（' + combos.length + ' 种查询），请减少选择', true);
+    return;
+  }
   let r = null;
   if (steam.loggedIn) {
     // 登录后走 Steam 客户端 QueryFiles，条目与 WE 客户端一致
-    r = await callBridge('browseOnline', buildOnlineQuery());
+    if (combos.length === 1) {
+      r = await callBridge('browseOnline', buildOnlineQuery(combos[0]));
+    } else {
+      const rs = await Promise.all(combos.map((c) => callBridge('browseOnline', buildOnlineQuery(c))));
+      r = mergeResults(rs);
+    }
   }
   if (!r || !r.ok) {
     // 未登录 / Steam 查询失败 → 回退网页匿名抓取（条目会少于客户端）
     if (steam.loggedIn) setStatus('Steam 客户端查询失败，已回退网页数据…');
-    r = await callBridge('browse', buildQuery());
+    if (combos.length === 1) {
+      r = await callBridge('browse', buildQuery(combos[0]));
+    } else {
+      const rs2 = await Promise.all(combos.map((c) => callBridge('browse', buildQuery(c))));
+      r = mergeResults(rs2);
+    }
   }
   state.loading = false;
   if (!r || !r.ok) {
@@ -253,8 +317,7 @@ async function loadPage() {
   if (hasFull) {
     state.items.forEach((it) => { state.details[String(it.id)] = it; });
   }
-  const tagCount = state.typeTags.length + state.catTags.length + state.ageTags.length;
-  setStatus(state.items.length ? '' : (tagCount > 1 ? '没有找到同时满足所有已选标签的内容，试试减少标签' : '没有找到内容'));
+  setStatus(state.items.length ? '' : '没有找到内容，试试减少标签或换排序');
   render();
   if (!hasFull && state.items.length) {
     const ids = state.items.map((i) => i.id).join(',');
