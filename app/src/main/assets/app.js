@@ -565,8 +565,34 @@ function openSettings() {
   try { cur = window.Bridge.getProxy() || cur; } catch (e) { /* bridge 不可用时用缓存 */ }
   document.getElementById('proxyInput').value = cur || '';
   renderSteam();
+  refreshCacheSize();
   document.getElementById('settings').classList.remove('hidden');
 }
+
+function fmtCache(b) {
+  b = Number(b) || 0;
+  return b > 0 ? fmtSize(b) : '0 B';
+}
+
+async function refreshCacheSize() {
+  const el = document.getElementById('cacheSize');
+  if (el) el.textContent = '计算中…';
+  const r = await callBridge('cacheSize');
+  if (el) el.textContent = r && r.ok ? fmtCache(r.bytes) : '读取失败';
+}
+
+document.getElementById('clearCacheBtn').onclick = async () => {
+  const btn = document.getElementById('clearCacheBtn');
+  btn.disabled = true;
+  const r = await callBridge('clearCache');
+  btn.disabled = false;
+  if (r && r.ok) {
+    window.Bridge.toast('已释放 ' + fmtCache(r.bytes));
+    refreshCacheSize();
+  } else {
+    window.Bridge.toast('清除失败，请重试');
+  }
+};
 
 function closeSettings() {
   document.getElementById('settings').classList.add('hidden');

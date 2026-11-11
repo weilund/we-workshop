@@ -212,6 +212,37 @@ public class Bridge {
 
     /** 取消指定条目的下载（下载列表里的「取消」按钮）。 */
     @JavascriptInterface
+    public void cacheSize(String cb) {
+        pool.execute(() -> {
+            long bytes = 0L;
+            try {
+                bytes = WorkshopDownloader.cacheBytes(activity.getApplicationContext());
+            } catch (Throwable ignored) {
+            }
+            reply(cb, "{\"ok\":true,\"bytes\":" + bytes + "}");
+        });
+    }
+
+    @JavascriptInterface
+    public void clearCache(String cb) {
+        pool.execute(() -> {
+            long freed = 0L;
+            try {
+                freed = WorkshopDownloader.clearCache(activity.getApplicationContext());
+            } catch (Throwable ignored) {
+            }
+            final long f = freed;
+            main.post(() -> {
+                try {
+                    webView.clearCache(true);
+                } catch (Throwable ignored) {
+                }
+                reply(cb, "{\"ok\":true,\"bytes\":" + f + "}");
+            });
+        });
+    }
+
+    @JavascriptInterface
     public void cancelAllDownloads() {
         try {
             WorkshopDownloader.cancel();

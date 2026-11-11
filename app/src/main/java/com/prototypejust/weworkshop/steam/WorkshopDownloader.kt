@@ -150,6 +150,38 @@ object WorkshopDownloader {
 
     fun isCancelled(itemId: Long): Boolean = cancelledItems.contains(itemId)
 
+    /** 统计应用缓存目录占用（字节），用于设置页展示 */
+    @JvmStatic
+    fun cacheBytes(context: Context): Long {
+        val root: File = context.cacheDir ?: return 0L
+        return try {
+            root.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        } catch (t: Throwable) {
+            0L
+        }
+    }
+
+    /** 清理缓存（跳过正在下载的任务），返回释放的字节数 */
+    @JvmStatic
+    fun clearCache(context: Context): Long {
+        val before = cacheBytes(context)
+        val root: File? = context.cacheDir
+        if (root != null) {
+            val active = activeItems.toSet()
+            root.listFiles()?.forEach { f ->
+                if (f.isDirectory && f.name == "workshop") {
+                    f.listFiles()?.forEach { sub ->
+                        val id = sub.name.toLongOrNull()
+                        if (id == null || !active.contains(id)) runCatching { sub.deleteRecursively() }
+                    }
+                } else {
+                    runCatching { f.deleteRecursively() }
+                }
+            }
+        }
+        return (before - cacheBytes(context)).coerceAtLeast(0L)
+    }
+
     private fun emit(p: Progress, persist: Boolean = true) {
         lastProgress[p.itemId] = p
         val terminal = p.done || p.error != null

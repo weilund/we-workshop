@@ -532,3 +532,7 @@ body {
 .dl-open { border-color: #66c0f4; color: #66c0f4; }
 .dl-cancel { border-color: #f08a5d; color: #f08a5d; }
 .dl-retry { border-color: #66c0f4; color: #66c0f4; }
+
+.setting-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; }
+.setting-row-label { font-size: 14px; opacity: .8; }
+.setting-row-value { font-size: 14px; font-weight: 600; }
