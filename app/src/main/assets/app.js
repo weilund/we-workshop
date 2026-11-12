@@ -581,6 +581,27 @@ async function refreshCacheSize() {
   if (el) el.textContent = r && r.ok ? fmtCache(r.bytes) : '读取失败';
 }
 
+document.getElementById('diagBtn').onclick = async () => {
+  const box = document.getElementById('diagBox');
+  const btn = document.getElementById('diagBtn');
+  btn.disabled = true;
+  box.classList.remove('hidden');
+  box.textContent = '检测中…';
+  const r = await callBridge('steamDiagnostics');
+  btn.disabled = false;
+  if (!r) { box.textContent = '诊断失败'; return; }
+  const lines = [
+    'App 内代理：' + (r.proxy || '-'),
+    '系统代理：' + (r.systemProxy || '-'),
+    '网络/VPN：' + (r.vpn || '-'),
+    'Steam 连接：' + (r.connected ? '已连接' : '未连接'),
+    '登录状态：' + (r.loggedIn ? ('已登录 ' + (r.account || '')) : '未登录'),
+    '状态：' + (r.status || '-')
+  ];
+  if (r.error) lines.push('错误：' + r.error);
+  box.textContent = lines.join('\n');
+};
+
 document.getElementById('clearCacheBtn').onclick = async () => {
   const btn = document.getElementById('clearCacheBtn');
   btn.disabled = true;

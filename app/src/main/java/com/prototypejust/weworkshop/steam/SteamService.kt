@@ -2,6 +2,8 @@ package com.prototypejust.weworkshop.steam
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.util.Log
 import `in`.dragonbra.javasteam.enums.EOSType
 import `in`.dragonbra.javasteam.enums.EResult
@@ -291,6 +293,57 @@ object SteamService {
         append('}')
     }
 
+    /** 登录/网络诊断：代理设置、系统代理、VPN 状态、连接与登录状态。 */
+    @JvmStatic
+    fun diagnosticsJson(): String {
+        fun esc(v: String) = v.replace("\\", "\\\\").replace("\"", "\\\"")
+
+        val proxySetting = appContext?.getSharedPreferences("weworkshop", Context.MODE_PRIVATE)
+            ?.getString("proxy", "")?.trim().orEmpty()
+
+        var sysProxy = "读取失败"
+        try {
+            val ps = java.net.ProxySelector.getDefault()
+            val p = ps?.select(java.net.URI("https://steamcommunity.com"))?.firstOrNull()
+            sysProxy = when {
+                p == null -> "无（直连）"
+                p.type() == java.net.Proxy.Type.DIRECT -> "无（直连）"
+                else -> p.type().name + " " + p.address().toString()
+            }
+        } catch (t: Throwable) {
+            sysProxy = "读取失败"
+        }
+
+        var vpn = "未知"
+        try {
+            val cm = appContext?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val net = cm?.activeNetwork
+            val caps = if (net != null) cm?.getNetworkCapabilities(net) else null
+            vpn = when {
+                caps == null -> "无法读取网络状态"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN 已连接（可接管全部流量）"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi（未检测到系统 VPN）"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "移动数据（未检测到系统 VPN）"
+                else -> "其他网络（未检测到 VPN）"
+            }
+        } catch (t: Throwable) {
+            vpn = "读取失败"
+        }
+
+        return buildString {
+            append('{')
+            append("\"proxy\":\"").append(esc(if (proxySetting.isEmpty()) "直连（未设置）" else proxySetting)).append("\",")
+            append("\"systemProxy\":\"").append(esc(sysProxy)).append("\",")
+            append("\"vpn\":\"").append(esc(vpn)).append("\",")
+            append("\"connected\":").append(client?.isConnected == true).append(',')
+            append("\"loggedIn\":").append(isLoggedIn).append(',')
+            append("\"account\":\"").append(esc(accountName)).append("\",")
+            append("\"status\":\"").append(esc(status)).append("\",")
+            append("\"error\":\"").append(esc(error)).append('"')
+            append('}')
+        }
+    }
+
     // ---------------- 内部 ----------------
 
     private fun notifyState() {
@@ -503,7 +556,11 @@ object SteamService {
         val deadline = System.currentTimeMillis() + CONNECT_TIMEOUT_MS
         while (!c.isConnected) {
             if (System.currentTimeMillis() > deadline) {
-                throw IllegalStateException("连接 Steam 网络超时，请确认手机已开启 VPN/TUN 代理")
+                throw IllegalStateException(
+                    "连接 Steam 网络超时。" +
+                        "Steam 登录走的是长连接（WebSocket/TCP），不受「 App 内 HTTP 代理」设置控制；" +
+                        "请开启 VPN 的 TUN/全局模式，或在 VPN 分流规则里把「WE 工坊」加入代理。"
+                )
             }
             delay(200)
         }

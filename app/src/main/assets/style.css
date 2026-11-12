@@ -536,3 +536,9 @@ body {
 .setting-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; }
 .setting-row-label { font-size: 14px; opacity: .8; }
 .setting-row-value { font-size: 14px; font-weight: 600; }
+
+.diag-box {
+  margin: 8px 0 0; padding: 12px; border-radius: 10px; background: #14171e;
+  font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-all;
+  color: #c7cdd8; border: 1px solid #232833;
+}

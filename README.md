@@ -30,6 +30,25 @@ Wallpaper Engine 没有手机端，创意工坊也只能在 PC 客户端里看�
 - **下载**：`javaSteam` 建立 Steam 连接 → 获取 depot 密钥 / CDN 节点 / manifest 授权码 → 从 Steam CDN 下载 manifest 与分块 → AES 解密 + zstd/xz 解压 → 写入 `Download/Wallpaper WE/`
 - **网络**：需要能访问 Steam（国内需代理或 VPN，手机开全局代理 / TUN 模式即可）
 
+## 常见问题：开着 VPN 但 Steam 登录失败
+
+App 里有两个不同的网络通道，它们**不共用代理设置**：
+
+| 通道 | 用途 | 受什么影响 |
+| --- | --- | --- |
+| OkHttp / HttpURLConnection | 创意工坊列表、详情、GIF、CDN 下载 | 系统代理、App 内「网络代理」输入框 |
+| javaSteam 长连接（WebSocket/TCP） | **Steam 登录**、depot 密钥、manifest | 只受系统层 VPN/TUN 接管 |
+
+所以会出现：**列表能刷、图片能载、下载能跑，但一登录 Steam 就超时**。
+
+解决办法（任选其一）：
+
+1. 把 VPN 切换为 **TUN / 全局模式**（推荐）
+2. 使用分流规则时，把 `WE 工坊`（`com.prototypejust.weworkshop`）或 Steam CM 网段加入代理
+3. 设置页点「连接诊断」，确认「网络/VPN」一栏是否显示 VPN 已连接
+
+如果诊断显示 VPN 已连接但依然超时，多半是节点被 Steam 风控，换节点再试。
+
 ## 构建
 
 需要 JDK 17 与 Android SDK（compileSdk 35、build-tools 35.0.0）。在根目录创建 `local.properties`：

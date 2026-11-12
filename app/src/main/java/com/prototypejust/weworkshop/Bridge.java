@@ -212,6 +212,17 @@ public class Bridge {
 
     /** 取消指定条目的下载（下载列表里的「取消」按钮）。 */
     @JavascriptInterface
+    public void steamDiagnostics(String cb) {
+        String json;
+        try {
+            json = SteamService.diagnosticsJson();
+        } catch (Throwable t) {
+            json = "{\"error\":\"诊断失败\"}";
+        }
+        reply(cb, json);
+    }
+
+    @JavascriptInterface
     public void cacheSize(String cb) {
         pool.execute(() -> {
             long bytes = 0L;

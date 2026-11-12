@@ -121,6 +121,12 @@
     </div>
     <p class="setting-hint">账号密码仅用于向 Steam 换取登录令牌，令牌保存在本机，不会上传到其他服务器。</p>
 
+    <div class="detail-actions">
+      <button id="diagBtn" class="btn-ghost">连接诊断</button>
+    </div>
+    <pre id="diagBox" class="diag-box hidden"></pre>
+    <p class="setting-hint">如果开着 VPN 仍登录失败：Steam 登录走长连接，不受「网络代理」输入框影响。请把 VPN 切换为 TUN/全局模式，或在分流规则中把「WE 工坊」加入代理。</p>
+
     <h2 class="settings-title settings-title-gap">存储</h2>
     <div class="setting-row">
       <span class="setting-row-label">缓存占用</span>
