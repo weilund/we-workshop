@@ -21,6 +21,10 @@ import `in`.dragonbra.javasteam.steam.steamclient.callbackmgr.CallbackManager
 import `in`.dragonbra.javasteam.steam.steamclient.callbacks.ConnectedCallback
 import `in`.dragonbra.javasteam.steam.steamclient.callbacks.DisconnectedCallback
 import `in`.dragonbra.javasteam.steam.steamclient.configuration.SteamConfiguration
+import `in`.dragonbra.javasteam.networking.steam3.ProtocolTypes
+import `in`.dragonbra.javasteam.steam.discovery.FileServerListProvider
+import `in`.dragonbra.javasteam.steam.discovery.ServerRecord
+import `in`.dragonbra.javasteam.steam.webapi.SteamDirectory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -33,11 +37,18 @@ import `in`.dragonbra.javasteam.enums.EPublishedFileQueryType
 import `in`.dragonbra.javasteam.protobufs.steamclient.SteammessagesPublishedfileSteamclient.CPublishedFile_QueryFiles_Request
 import `in`.dragonbra.javasteam.protobufs.steamclient.SteammessagesPublishedfileSteamclient.CPublishedFile_QueryFiles_Response
 import `in`.dragonbra.javasteam.steam.handlers.steamunifiedmessages.SteamUnifiedMessages
+import `in`.dragonbra.javasteam.steam.handlers.steamunifiedmessages.callback.ServiceMethodResponse
 import `in`.dragonbra.javasteam.rpc.service.PublishedFile
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Duration
+import java.time.Instant
+import java.util.concurrent.CancellationException
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Steam 会话管理（javaSteam）。
@@ -50,10 +61,27 @@ import java.util.concurrent.TimeUnit
  */
 object SteamService {
     private const val TAG = "WESteam"
-    private const val CONNECT_TIMEOUT_MS = 40_000L
     private const val LOGON_TIMEOUT_MS = 90_000L
+    /** 单个候选 CM 节点的最长等待：12 秒连不上就换下一个候选，避免在死节点上傻等。 */
+    private const val CONNECT_PER_ATTEMPT_MS = 12_000L
+    /** 连接候选节点的最大尝试次数（每次由 SmartCMServerList 选一个不同节点）。 */
+    private const val CONNECT_ATTEMPTS = 3
+
+    /** 目录服务不可用时的保底 CM 节点（TCP 27017），域名可直接解析连接。 */
+    private val FALLBACK_TCP_SERVERS = listOf(
+        "ext1-sea1.steamserver.net:27017",
+        "cm01-tyo1.cm.steampowered.com:27017",
+        "cm01-sgp1.cm.steampowered.com:27017",
+        "cm01-hkg1.cm.steampowered.com:27017",
+        "ext1-ord1.steamserver.net:27017"
+    )
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    @Volatile private var guardKeepAliveJob: Job? = null
+    /** 会话恢复互斥：init() 可能被多次调用（Activity 重建、进程内重启），
+     *  并发执行 restoreSession 会同时操作同一个 client，互相覆盖 logonCallback，
+     *  导致"时好时坏"的随机登录失败。 */
+    @Volatile private var restoring = false
 
     @Volatile private var client: SteamClient? = null
     @Volatile private var callbackManager: CallbackManager? = null
@@ -64,6 +92,15 @@ object SteamService {
     @Volatile private var appContext: Context? = null
     @Volatile private var refreshToken: String = ""
     @Volatile private var reconnectJob: Job? = null
+    /** 会话恢复任务句柄：Activity 重建会重复调用 init()，用它保证同一时刻只有一个 restoreSession。 */
+    @Volatile private var restoreJob: Job? = null
+    /** CM 连接断开计数：connectAndWait() 用它判断当前候选节点是否已失败，不必傻等满 12 秒。 */
+    private val disconnectSeq = AtomicInteger(0)
+    /** 已为其准备过候选节点的 SteamClient 实例。
+     *  不能用 servers.getAllEndPoints() 当"是否已准备"的判据：该方法字节码第一步就是
+     *  startFetchingServers() -> resolveServerList(false)，会隐式读盘并返回非空列表。
+     *  scheduleReconnect() 重建 client 时必须同步清空本字段。 */
+    @Volatile private var preparedClient: SteamClient? = null
 
     @Volatile var isLoggedIn = false
         private set
@@ -101,7 +138,41 @@ object SteamService {
 
     @JvmStatic
     fun init(context: Context) {
-        if (prefs != null) return
+        if (prefs != null) {
+            // 已经是第二次 init（Activity 重建 / 进程内重启）。原逻辑直接 return，
+            // 导致此时若 client 已断开、isLoggedIn 已为 false，界面会一直显示未登录、
+            // 且不会触发任何恢复动作，用户看到的就是"连不上 Steam"。
+            // 这里补一次恢复：有 token 但当前未登录/未连接时重新建立会话。
+            if (refreshToken.isNotBlank() && accountName.isNotBlank() &&
+                (!isLoggedIn || client?.isConnected != true) &&
+                restoreJob?.isActive != true && !busy
+            ) {
+                // 关键：在调用线程上同步置 restoring 并先推一次状态，前端启动瞬间
+                // 就能看到"正在恢复会话"，而不是空白或"未登录"。协程内部不再重复
+                // 判断 restoring（否则会把自己挡掉）。
+                restoring = true
+                error = ""
+                status = "正在恢复 Steam 会话…"
+                notifyState()
+                restoreJob = scope.launch {
+                    try {
+                        restoreSession(accountName, refreshToken)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "re-init restore failed", t)
+                        fileLog("re-init restore failed: ${t.javaClass.simpleName}: ${t.message}")
+                        isLoggedIn = false
+                        status = "正在重连 Steam…"
+                    } finally {
+                        restoring = false
+                        notifyState()
+                        if (!isLoggedIn && refreshToken.isNotBlank() && accountName.isNotBlank()) {
+                            scheduleReconnect()
+                        }
+                    }
+                }
+            }
+            return
+        }
         val app = context.applicationContext
         appContext = app
         val sp = app.getSharedPreferences("steam_session", Context.MODE_PRIVATE)
@@ -111,15 +182,26 @@ object SteamService {
         refreshToken = token
         if (token.isNotBlank() && account.isNotBlank()) {
             accountName = account
+            // 关键：在 scope.launch 之前同步置位并推送状态，否则前端在协程被调度前
+            // 看不到 restoring，会短暂显示"未登录"。
+            restoring = true
+            error = ""
             status = "正在恢复 Steam 会话…"
-            scope.launch {
+            notifyState()
+            restoreJob = scope.launch {
                 try {
                     restoreSession(account, token)
                 } catch (t: Throwable) {
                     Log.w(TAG, "restore session failed", t)
+                    fileLog("init restore failed: ${t.javaClass.simpleName}: ${t.message}")
                     isLoggedIn = false
-                    status = "未登录"
+                    status = "正在重连 Steam…"
+                } finally {
+                    restoring = false
                     notifyState()
+                    if (!isLoggedIn && refreshToken.isNotBlank() && accountName.isNotBlank()) {
+                        scheduleReconnect()
+                    }
                 }
             }
         }
@@ -142,6 +224,12 @@ object SteamService {
     /** 用户名密码登录（含 Guard 等待）。返回是否成功。 */
     suspend fun login(username: String, password: String): Boolean {
         if (busy) return false
+        // 手动登录优先：先停掉后台的会话恢复/自动重连任务，
+        // 避免它们与本流程同时操作同一个 client（互相覆盖 logonCallback、置空连接）。
+        restoreJob?.cancel()
+        restoreJob = null
+        reconnectJob?.cancel()
+        restoring = false
         busy = true
         error = ""
         guardNeeded = false
@@ -187,7 +275,7 @@ object SteamService {
             return true
         } catch (t: Throwable) {
             Log.e(TAG, "login failed", t)
-            fileLog("login failed: ${t.javaClass.simpleName}: ${t.message}")
+            fileLog("login failed: ${t.javaClass.simpleName}: ${t.message} | connected=${client?.isConnected} | guardNeeded=$guardNeeded | cause=${t.cause?.javaClass?.simpleName}:${t.cause?.message}")
             isLoggedIn = false
             error = friendlyError(t)
             status = error
@@ -195,6 +283,13 @@ object SteamService {
             return false
         } finally {
             busy = false
+            // 登录流程结束（成功或失败）后才隐藏验证码输入框；
+            // 提交验证码时不能提前把 guardNeeded 置 false，否则输入框会在
+            // 用户提交后立刻消失，导致无法重试输入。
+            guardNeeded = false
+            guardFuture = null
+            stopGuardKeepAlive()
+            notifyState()
         }
     }
 
@@ -204,10 +299,16 @@ object SteamService {
             connectAndWait()
             status = "正在恢复 Steam 会话…"
             notifyState()
-            logOnWithToken(account, token)
+            try {
+                logOnWithToken(account, token)
+            } catch (t: Throwable) {
+                fileLog("restoreSession logon failed: ${t.javaClass.simpleName}: ${t.message} connected=${client?.isConnected}")
+                throw t
+            }
             isLoggedIn = true
             status = "已登录：$account"
             notifyState()
+            fileLog("session restored: $account")
             Log.i(TAG, "session restored: $account")
         }
     }
@@ -216,49 +317,81 @@ object SteamService {
     private fun scheduleReconnect() {
         if (reconnectJob?.isActive == true) return
         if (refreshToken.isBlank() || accountName.isBlank()) return
-        reconnectJob = scope.launch {
-            var attempt = 0
-            while (isActive && attempt < 10) {
-                attempt++
-                if (busy) { delay(1_000L); continue }  // 用户正在手动登录时让路
-                status = "网络断开，正在重连 Steam…（第 $attempt 次）"
-                notifyState()
-                delay(minOf(20_000L, 1_000L * attempt))
-                try {
-                    if (client?.isConnected != true) {
-                        ensureClient()
-                        connectAndWait()
-                    }
-                    logOnWithToken(accountName, refreshToken)
-                    isLoggedIn = true
-                    error = ""
-                    status = "已登录：$accountName"
+        val job = scope.launch {
+            try {
+                var attempt = 0
+                while (isActive && attempt < 10) {
+                    attempt++
+                    if (busy) { delay(1_000L); continue }  // 用户正在手动登录时让路
+                    status = "网络断开，正在重连 Steam…（第 $attempt 次）"
                     notifyState()
-                    Log.i(TAG, "reconnected on attempt $attempt")
-                    return@launch
-                } catch (t: Throwable) {
-                    Log.w(TAG, "reconnect attempt $attempt failed: ${t.message}")
-                    runCatching { client?.disconnect() }
-                    delay(500)
+                    delay(minOf(20_000L, 1_000L * attempt))
+                    try {
+                        if (client?.isConnected != true) {
+                            ensureClient()
+                            connectAndWait()
+                        }
+                        logOnWithToken(accountName, refreshToken)
+                        isLoggedIn = true
+                        error = ""
+                        status = "已登录：$accountName"
+                        notifyState()
+                        Log.i(TAG, "reconnected on attempt $attempt")
+                        fileLog("reconnected on attempt $attempt")
+                        return@launch
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "reconnect attempt $attempt failed: ${t.message}")
+                        // 关键：重建 client。ensureClient() 遇到已有实例会直接返回，
+                        // 若该实例连接已死，后续 connectAndWait() 永远等不到 isConnected，
+                        // 于是重连 10 次全部失败，登录态被判为丢失，列表回退到很慢的
+                        // steamcommunity.com 网页抓取。
+                        runCatching { client?.disconnect() }
+                        client = null
+                        preparedClient = null
+                        callbackManager = null
+                        user = null
+                        apps = null
+                        content = null
+                        delay(500)
+                    }
                 }
+                isLoggedIn = false
+                status = "Steam 连接已断开，请检查网络后重试"
+                notifyState()
+            } finally {
+                // 只在"当前重连任务仍然是自己"时置空，避免把后来新建的任务清掉；
+                // 无论成功/失败/被取消都要刷新一次前端，让 reconnecting 及时变 false。
+                if (reconnectJob === coroutineContext[Job]) reconnectJob = null
+                notifyState()
             }
-            isLoggedIn = false
-            status = "Steam 连接已断开，请检查网络后重试"
-            notifyState()
         }
+        reconnectJob = job
     }
 
     @JvmStatic
     fun submitGuardCode(code: String) {
         val trimmed = code.trim()
         if (trimmed.isEmpty()) return
-        val f = guardFuture ?: return
+        val f = guardFuture ?: run {
+            fileLog("submit guard code ignored: no pending guard future (input dropped)")
+            return
+        }
         guardFuture = null
-        guardNeeded = false
-        fileLog("submit guard code: $trimmed")
+        // 保持 guardNeeded = true 直到登录真正结束，否则前端会把验证码输入框隐藏，
+        // 用户重试时无处输入。真正的清理放在 login() 的 finally 里。
+        guardNeeded = true
+        stopGuardKeepAlive()
+        fileLog("submit guard code: $trimmed (connected=${client?.isConnected}, guardType=$guardType)")
         status = "正在验证 Steam Guard…"
+        // 注意：不要在这里把 guard=false 推给前端，否则验证码输入框会在
+        // 用户提交后立刻消失；等登录结果（成功或失败）再隐藏。
         notifyState()
-        f.complete(trimmed)
+        try {
+            f.complete(trimmed)
+            fileLog("submit guard code: future completed, waiting for auth coroutine")
+        } catch (t: Throwable) {
+            fileLog("submit guard code: complete() threw ${t.javaClass.simpleName}: ${t.message}")
+        }
     }
 
     @JvmStatic
@@ -271,6 +404,9 @@ object SteamService {
             steamId64 = 0L
             accountName = ""
             refreshToken = ""
+            restoreJob?.cancel()
+            restoreJob = null
+            restoring = false
             reconnectJob?.cancel()
             prefs?.edit()?.remove("refresh_token")?.remove("account_name")?.apply()
             status = "未登录"
@@ -284,6 +420,10 @@ object SteamService {
         append('{')
         append("\"loggedIn\":").append(isLoggedIn).append(',')
         append("\"busy\":").append(busy).append(',')
+        // 前端启动瞬间就能知道"正在恢复本地会话"，不必等首帧状态推送。
+        append("\"restoring\":").append(restoring).append(',')
+        append("\"reconnecting\":").append(reconnectJob?.isActive == true).append(',')
+        append("\"hasToken\":").append(refreshToken.isNotBlank() && accountName.isNotBlank()).append(',')
         append("\"guard\":").append(guardNeeded).append(',')
         append("\"guardType\":\"").append(guardType.replace("\"", "")).append("\",")
         append("\"guardEmail\":\"").append(guardEmail.replace("\"", "")).append("\",")
@@ -360,9 +500,49 @@ object SteamService {
         guardNeeded = true
         val f = CompletableFuture<String>()
         guardFuture = f
+        // 等待用户输入验证码期间保活：万一连接落在空闲超时较短的通道上，
+        // 定期重连/探测可避免提交验证码时作业已被 cancel。
+        startGuardKeepAlive()
         notifyGuard()
         notifyState()
         return f
+    }
+
+    /**
+     * 等待 Steam Guard 验证码期间保持 CM 连接存活。
+     *
+     * 背景：javaSteam 只在 logon 成功后才启动心跳（CMClient 的 heartBeatFunc
+     * 仅在 EResult.OK 分支 start），未登录期间完全靠服务端策略。实测 Steam 的
+     * WebSocket(443) 通道约 30 秒即断开匿名空闲连接，而用户去邮箱取验证码通常
+     * 超过 30 秒，于是提交验证码时连接已断，抛出 CancellationException。
+     *
+     * 这里不依赖私有 API（SteamClient.send 为包私有），改为：
+     *  - 已强制 TCP，空闲 240s 不中断，正常情况下无需干预；
+     *  - 仍然监控连接状态，若发现断开则记录，便于诊断。
+     */
+    private fun startGuardKeepAlive() {
+        guardKeepAliveJob?.cancel()
+        guardKeepAliveJob = scope.launch {
+            var elapsed = 0
+            while (isActive && guardNeeded) {
+                delay(5_000L)
+                elapsed += 5
+                val c = client
+                if (c == null || !c.isConnected) {
+                    fileLog("guard keepalive: connection lost after ${elapsed}s while waiting for code")
+                    notifyState()
+                    break
+                }
+                if (elapsed % 30 == 0) {
+                    fileLog("guard keepalive: still connected after ${elapsed}s (waiting for code)")
+                }
+            }
+        }
+    }
+
+    private fun stopGuardKeepAlive() {
+        guardKeepAliveJob?.cancel()
+        guardKeepAliveJob = null
     }
 
     // ---------------- 创意工坊查询（与 Steam 客户端一致的数据源） ----------------
@@ -382,6 +562,24 @@ object SteamService {
             Log.e(TAG, "queryPublishedFiles failed", t)
             throw t
         }
+    }
+
+    /**
+     * 单次 QueryFiles 调用。
+     *
+     * PublishedFile.queryFiles 返回 AsyncJobSingle，
+     * 其父类 AsyncJob 默认 timeout = 10_000L（10 秒）。原实现只把 .get() 写成 90 秒，
+     * 并未调高 job.timeout，多标签并发或网络抖动时 AsyncJobManager 会在 10 秒时
+     * cancel 掉作业，抛 CancellationException（表现为"工坊查询失败"）。
+     */
+    private fun queryFilesOnce(
+        unified: SteamUnifiedMessages,
+        req: CPublishedFile_QueryFiles_Request
+    ): ServiceMethodResponse<CPublishedFile_QueryFiles_Response.Builder> {
+        val service = unified.createService(PublishedFile::class.java)
+        val job = service.queryFiles(req)
+        job.timeout = 25_000L
+        return job.toFuture().get(28, TimeUnit.SECONDS)
     }
 
     private fun queryPublishedFilesInner(queryJson: String): String {
@@ -417,8 +615,21 @@ object SteamService {
 
         val unified = c.getHandler(SteamUnifiedMessages::class.java)
             ?: throw IllegalStateException("Steam 客户端不支持统一消息")
-        val service = unified.createService(PublishedFile::class.java)
-        val resp = service.queryFiles(builder.build()).toFuture().get(90, TimeUnit.SECONDS)
+        val req = builder.build()
+        // 轻量重试 1 次：仅对"作业被取消/超时"这类瞬态失败重试，
+        // 且必须仍是登录且连接存活，避免在断线状态下白等 28 秒。
+        val resp = try {
+            queryFilesOnce(unified, req)
+        } catch (t: Throwable) {
+            val retryable = t is CancellationException ||
+                t is TimeoutException ||
+                (t is ExecutionException &&
+                    (t.cause is CancellationException || t.cause is TimeoutException))
+            if (!retryable || !isLoggedIn || client?.isConnected != true) throw t
+            fileLog("queryFiles attempt 1 failed (${t.javaClass.simpleName}: ${t.message}), retrying once")
+            Thread.sleep(300L)
+            queryFilesOnce(unified, req)
+        }
         if (resp.result != EResult.OK) {
             throw IllegalStateException("工坊查询失败：${resp.result}")
         }
@@ -502,17 +713,45 @@ object SteamService {
         // javaSteam 用 OkHttp 下载 CDN 内容，不会读系统代理，必须显式配置，
         // 否则手机在代理/VPN 环境下 CDN 请求直连会 403。
         val proxy = savedProxy()
+        // 高并发传输配置：OkHttp 默认 maxRequestsPerHost = 5，
+        // 会把单个 CDN 域名的并发锁死在 5 条连接上（多分块并行下载时其余全部排队，
+        // 表现为"节点很快但下载很慢"）。此处放宽到单 host 32、全局 96，
+        // 以配合 WorkshopDownloader 的 24 路异步网络预取 + 6 线程解压写盘流水线。
+        val dispatcher = okhttp3.Dispatcher().apply {
+            maxRequests = 128
+            maxRequestsPerHost = 32
+        }
+        val connectionPool = okhttp3.ConnectionPool(48, 2, TimeUnit.MINUTES)
+        // 超时按路径拆分：CDN 大文件仍需 90 秒长读超时；而 WebAPI
+        // （ISteamDirectory / GetCMListForConnect 等）走短超时——国内直连环境下
+        // api.steampowered.com 可能 TCP 握手通、TLS/HTTP 响应却黑洞，
+        // 沿用 90 秒会把 c.connect() 同步卡死整整 90 秒后才抛 IOException。
         val http = okhttp3.OkHttpClient.Builder()
-            .connectTimeout(20, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(90, TimeUnit.SECONDS)
+            .dispatcher(dispatcher)
+            .connectionPool(connectionPool)
             .apply { if (proxy != null) proxy(proxy) }
             .addInterceptor { chain ->
                 val req = chain.request()
-                val resp = chain.proceed(req)
-                if (req.url.encodedPath.contains("/depot/")) {
-                    fileLog("CDN ${resp.code} proxy=${proxy ?: "direct"} ${req.url}")
+                val isDepot = req.url.encodedPath.contains("/depot/")
+                if (isDepot) {
+                    // 国内 CDN 走 DoH 多边缘 IP 分流直连（保留 Host 头，异常自动回退原域名），
+                    // 同时收紧分块 socket 连接/读取超时，避免单边缘节点 100Mbps 限速与死连接。
+                    val resp = DomesticCdnStriper.proceedDepot(chain, req, proxy)
+                    // 只记录失败（403/5xx 等）：成功时每个 1MB 分块都会走一次本分支，
+                    // 在 OkHttp 网络线程上同步 open/append/close 日志文件，
+                    // 既拖慢吞吐又造成大量无意义 IO。失败诊断价值高，仍需保留。
+                    if (!resp.isSuccessful) {
+                        fileLog("CDN ${resp.code} proxy=${proxy ?: "direct"} ${req.url}")
+                    }
+                    resp
+                } else {
+                    // WebAPI：连接 4 秒、读取 5 秒，杜绝目录服务黑洞时卡满 90 秒。
+                    chain.withConnectTimeout(4, TimeUnit.SECONDS)
+                        .withReadTimeout(5, TimeUnit.SECONDS)
+                        .proceed(req)
                 }
-                resp
             }
             .build()
         Log.i(TAG, "steam okhttp proxy: ${proxy ?: "direct"}")
@@ -520,6 +759,25 @@ object SteamService {
         val configuration = SteamConfiguration.create { builder ->
             builder.withConnectionTimeout(15_000L)
             builder.withHttpClient(http)
+            // 持久化 CM 节点缓存：否则每次新进程启动 lastServerListRefresh 都是
+            // Instant.MIN，SmartCMServerList.resolveServerList() 会在 c.connect()
+            // 的同步锁内直接请求 api.steampowered.com，一次黑洞就卡满 90 秒。
+            val ctx = appContext
+            if (ctx != null) {
+                builder.withServerListProvider(
+                    FileServerListProvider(java.io.File(ctx.filesDir, "cm_servers.bin"))
+                )
+            }
+            // 关闭 SmartCMServerList 的自动目录拉取：它失败时会同步抛 IOException
+            // 把 c.connect() 直接炸断。改由 ensureServerCandidates() 受控拉取 + 保底。
+            builder.withDirectoryFetch(false)
+            // 强制走 TCP（27017）。javaSteam 在未登录状态下不发心跳，
+            // 而 Steam 的 WebSocket(443) 通道对匿名空闲连接有约 30 秒硬超时，
+            // 实测 30.02s 必被服务端断开；TCP 通道实测 240s 以上不断。
+            // 登录时要等用户去邮箱取 Steam Guard 验证码，往往会超过 30 秒，
+            // 落在 WebSocket 上就会在提交验证码时抛出 CancellationException
+            // （AsyncJobManager.cancelPendingJobs -> CompletableFuture.cancel）。
+            builder.withProtocolTypes(ProtocolTypes.TCP)
         }
         val c = SteamClient(configuration)
         val cm = CallbackManager(c)
@@ -530,9 +788,16 @@ object SteamService {
         content = c.getHandler(SteamContent::class.java)
         cm.subscribe(ConnectedCallback::class.java) { Log.i(TAG, "steam connected") }
         cm.subscribe(DisconnectedCallback::class.java) {
-            Log.i(TAG, "steam disconnected (loggedIn=$isLoggedIn, hasToken=${refreshToken.isNotBlank()})")
+            // 断开序号自增：connectAndWait() 据此判断"当前候选节点已失败"，立即换节点。
+            disconnectSeq.incrementAndGet()
+            Log.i(TAG, "steam disconnected (loggedIn=$isLoggedIn, busy=$busy, restoring=$restoring, hasToken=${refreshToken.isNotBlank()})")
             if (isLoggedIn) {
                 isLoggedIn = false
+            }
+            // 关键：只有"没在手动登录、也没在恢复会话"时才自动重连。
+            // 否则 login()/restoreSession() 执行途中底层连接失败，本回调会并发启动
+            // scheduleReconnect() 抢占甚至把同一个 client 置空（原竞态根因）。
+            if (!busy && !restoring && refreshToken.isNotBlank() && accountName.isNotBlank()) {
                 status = "网络断开，正在重连 Steam…"
                 notifyState()
                 scheduleReconnect()
@@ -540,7 +805,9 @@ object SteamService {
         }
         cm.subscribe(LoggedOnCallback::class.java) { cb -> logonCallback = cb }
         scope.launch {
-            while (true) {
+            // scheduleReconnect() 重建 client 后会把 callbackManager 置 null，
+            // 旧协程必须跟着退出，否则会对已废弃的 CallbackManager 永久空转。
+            while (isActive && callbackManager === cm) {
                 runCatching { cm.runWaitCallbacks(1000L) }
                     .onFailure { Log.e(TAG, "callback loop error", it) }
                 delay(10)
@@ -549,21 +816,88 @@ object SteamService {
         return c
     }
 
+    /**
+     * 确保 SmartCMServerList 里有可用的 TCP 候选节点。
+     *
+     * 顺序：已为当前 client 准备过 → 7 天内的本地缓存 → 目录服务（受 4s/5s 短超时保护）
+     * → 过期缓存 → 硬编码保底种子。
+     * 任何一步失败都不向调用方抛异常：连不上目录就退化，绝不让 connect() 被炸断。
+     */
+    private fun ensureServerCandidates(c: SteamClient, forceRefresh: Boolean = false) {
+        // 不能用 c.servers.getAllEndPoints() 判断"是否已有节点"：该方法字节码第一步就是
+        // startFetchingServers() -> resolveServerList(false)，只要磁盘上存在
+        // cm_servers.bin（哪怕已超过 7 天）就会隐式载入并返回非空列表，
+        // 使下面的 7 天新鲜度检查被绕过、缓存日志也永远打不出来。
+        // 改用 preparedClient 记录"已为哪个 SteamClient 准备过节点"。
+        if (!forceRefresh && preparedClient === c) return
+        val provider = c.configuration.serverListProvider
+        val cached: List<ServerRecord> =
+            runCatching { provider.fetchServerList() }.getOrDefault(emptyList())
+        val lastRefresh: Instant =
+            runCatching { provider.lastServerListRefresh }.getOrDefault(Instant.MIN)
+        val hasCachedTcp = cached.any { it.protocolTypes.contains(ProtocolTypes.TCP) }
+        val cacheFresh = hasCachedTcp &&
+            runCatching {
+                Duration.between(lastRefresh, Instant.now()) < Duration.ofDays(7)
+            }.getOrDefault(false)
+        if (!forceRefresh && cacheFresh) {
+            c.servers.replaceList(cached, false, lastRefresh)
+            preparedClient = c
+            fileLog("cm servers loaded from cache (${cached.size})")
+            return
+        }
+        val fetched = runCatching { SteamDirectory.load(c.configuration) }.getOrNull()
+        if (fetched != null && fetched.any { it.protocolTypes.contains(ProtocolTypes.TCP) }) {
+            c.servers.replaceList(fetched, true, Instant.now())
+            preparedClient = c
+            fileLog("cm servers fetched from directory (${fetched.size})")
+            return
+        }
+        if (hasCachedTcp) {
+            c.servers.replaceList(cached, false, lastRefresh)
+            fileLog("SteamDirectory unavailable, using stale cache (${cached.size})")
+        } else {
+            val seeds = FALLBACK_TCP_SERVERS.mapNotNull { ServerRecord.tryCreateSocketServer(it) }
+            c.servers.replaceList(seeds, false, Instant.MIN)
+            fileLog("SteamDirectory unavailable, using fallback TCP seeds (${seeds.size})")
+        }
+        preparedClient = c
+    }
+
     private suspend fun connectAndWait() {
         val c = ensureClient()
         if (c.isConnected) return
-        c.connect()
-        val deadline = System.currentTimeMillis() + CONNECT_TIMEOUT_MS
-        while (!c.isConnected) {
-            if (System.currentTimeMillis() > deadline) {
-                throw IllegalStateException(
+        ensureServerCandidates(c, forceRefresh = false)
+        // 最多尝试 CONNECT_ATTEMPTS 个候选节点，每个只等 12 秒：
+        // 原实现只 connect() 一次再死等 40 秒，一旦选到被墙/黑洞节点必然整体超时。
+        for (attempt in 1..CONNECT_ATTEMPTS) {
+            if (attempt == CONNECT_ATTEMPTS) {
+                // 最后一次尝试前强制刷新节点列表（缓存可能过期、目录可能已恢复）。
+                ensureServerCandidates(c, forceRefresh = true)
+            }
+            if (c.isConnected) return
+            val seqBefore = disconnectSeq.get()
+            c.connect()
+            val deadline = System.currentTimeMillis() + CONNECT_PER_ATTEMPT_MS
+            while (System.currentTimeMillis() < deadline) {
+                if (c.isConnected) {
+                    fileLog("steam connected on attempt $attempt")
+                    return
+                }
+                if (disconnectSeq.get() != seqBefore) {
+                    // 该候选节点已连接失败并断开：不必傻等剩余秒数，立即换下一个候选。
+                    fileLog("cm candidate $attempt failed, switching to next server")
+                    delay(250L)
+                    break
+                }
+                delay(150L)
+            }
+        }
+        throw IllegalStateException(
                     "连接 Steam 网络超时。" +
                         "Steam 登录走的是长连接（WebSocket/TCP），不受「 App 内 HTTP 代理」设置控制；" +
                         "请开启 VPN 的 TUN/全局模式，或在 VPN 分流规则里把「WE 工坊」加入代理。"
                 )
-            }
-            delay(200)
-        }
     }
 
     private suspend fun logOnWithToken(account: String, token: String) {

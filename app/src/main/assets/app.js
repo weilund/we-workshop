@@ -28,6 +28,7 @@ const state = {
   detailId: null,
   downloads: {},
   loading: false,
+  dataSource: null,
 };
 
 /* ---- 筛选状态持久化：重开 App 记住上次的排序/类型/分类/分级/搜索 ---- */
@@ -156,10 +157,18 @@ function typeLabel(tag) {
   }
 }
 
-function setStatus(text, isError) {
+function setStatus(text, isError, showRetry) {
   const el = document.getElementById('status');
-  el.textContent = text || '';
+  el.textContent = text || ''; // textContent 写入，防 XSS
   el.className = 'status' + (isError ? ' error' : '');
+  if (showRetry) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'status-retry-btn';
+    btn.textContent = '点击刷新';
+    btn.onclick = () => loadPage({ allowWebFallback: true, manual: true });
+    el.appendChild(btn);
+  }
 }
 
 function render() {
@@ -273,30 +282,53 @@ function mergeResults(list) {
   return { ok: true, items: items, total: total };
 }
 
-async function loadPage() {
-  if (state.loading) return;
+let loadSeq = 0;
+let restoreWaitTimer = null;
+
+function setRefreshSpinning(on) {
+  const btn = document.getElementById('refreshBtn');
+  if (btn) btn.classList.toggle('spinning', !!on);
+}
+
+async function loadPage(opts) {
+  opts = opts || {};
+  clearTimeout(restoreWaitTimer);
+  restoreWaitTimer = null;
+  // 启动期 Steam 会话仍在恢复：先等原生推送 loggedIn，不发起必卡 15~30 秒的网页匿名抓取
+  if (!steam.loggedIn && (steam.restoring || steam.busy) && !opts.allowWebFallback && !opts.manual) {
+    state.loading = false;
+    setRefreshSpinning(false);
+    if (state.items.length === 0) setStatus('正在恢复 Steam 登录态，稍候自动加载…', false, false);
+    restoreWaitTimer = setTimeout(() => { if (!steam.loggedIn) loadPage({ allowWebFallback: true }); }, 8000);
+    return;
+  }
+  const seq = ++loadSeq;
   state.loading = true;
+  setRefreshSpinning(true);
   setStatus('加载中…');
   document.getElementById('list').innerHTML = '';
   const combos = buildTagCombos();
   if (combos.length > MAX_TAG_COMBOS) {
-    state.loading = false;
-    setStatus('标签组合太多（' + combos.length + ' 种查询），请减少选择', true);
+    if (seq === loadSeq) {
+      state.loading = false;
+      setRefreshSpinning(false);
+      setStatus('标签组合太多（' + combos.length + ' 种查询），请减少选择', true, true);
+    }
     return;
   }
   let r = null;
+  const usedOnline = !!steam.loggedIn;
   if (steam.loggedIn) {
-    // 登录后走 Steam 客户端 QueryFiles，条目与 WE 客户端一致
+    // 登录后走 Steam 客户端 QueryFiles，条目与 WE 客户端一致。
+    // 失败时不回退网页抓取：国内直连 steamcommunity.com 会卡 15~30 秒，直接给出错误 + 一键重试
     if (combos.length === 1) {
       r = await callBridge('browseOnline', buildOnlineQuery(combos[0]));
     } else {
       const rs = await Promise.all(combos.map((c) => callBridge('browseOnline', buildOnlineQuery(c))));
       r = mergeResults(rs);
     }
-  }
-  if (!r || !r.ok) {
-    // 未登录 / Steam 查询失败 → 回退网页匿名抓取（条目会少于客户端）
-    if (steam.loggedIn) setStatus('Steam 客户端查询失败，已回退网页数据…');
+  } else {
+    // 未登录：网页匿名抓取（条目会少于客户端）
     if (combos.length === 1) {
       r = await callBridge('browse', buildQuery(combos[0]));
     } else {
@@ -304,14 +336,17 @@ async function loadPage() {
       r = mergeResults(rs2);
     }
   }
+  if (seq !== loadSeq) return; // 已有更新的请求接管，丢弃过期结果
   state.loading = false;
+  setRefreshSpinning(false);
   if (!r || !r.ok) {
-    setStatus('加载失败：' + ((r && r.error) || '未知错误'), true);
+    setStatus('加载失败：' + ((r && r.error) || '未知错误'), true, true);
     return;
   }
   state.items = r.items || [];
   state.total = Number(r.total) || 0;
   state.details = {};
+  state.dataSource = usedOnline ? 'online' : 'web';
   // Steam 客户端 QueryFiles 已带回完整字段（含 file_size / hcontent_file），无需再补详情
   const hasFull = state.items.length > 0 && state.items[0].file_size !== undefined;
   if (hasFull) {
@@ -322,6 +357,7 @@ async function loadPage() {
   if (!hasFull && state.items.length) {
     const ids = state.items.map((i) => i.id).join(',');
     const dr = await callBridge('details', ids);
+    if (seq !== loadSeq) return; // 详情补全回来时可能已有新请求，过期结果不写入
     if (dr && dr.ok && dr.items) {
       Object.keys(dr.items).forEach((k) => { state.details[k] = dr.items[k]; });
       render();
@@ -359,15 +395,49 @@ function fillDetail(d) {
 
   const dl = document.getElementById('downloadBtn');
   dl.classList.remove('hidden');
-  const dp = state.downloads[String(d.id || '')];
-  const downloading = dp && !dp.done && !dp.error;
-  dl.textContent = downloading ? '下载中…'
-    : (d.file_size ? '下载到手机（' + fmtSize(d.file_size) + '）' : '下载到手机');
+  updateDetailDownloadBtn(d);
   dl.onclick = () => startDownload(d);
   document.getElementById('detail').dataset.itemId = String(d.id || '');
   document.getElementById('openSteamBtn').onclick = () => {
     window.Bridge.openUrl('https://steamcommunity.com/sharedfiles/filedetails/?id=' + d.id);
   };
+}
+
+function findStoredDownload(key) {
+  try {
+    if (!window.Bridge || !window.Bridge.getDownloads) return null;
+    const arr = JSON.parse(window.Bridge.getDownloads() || '[]');
+    const hit = arr.find((x) => String(x.id) === String(key));
+    if (!hit) return null;
+    return {
+      itemId: Number(hit.id),
+      received: Number(hit.received) || 0,
+      total: Number(hit.size) || 0,
+      phase: hit.status === 'paused' ? '已暂停' : (hit.status === 'done' ? '已完成' : ''),
+      done: hit.status === 'done',
+      paused: hit.status === 'paused',
+      error: hit.status === 'canceled' ? '已取消' : (hit.status === 'failed' ? '连接中断' : null),
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+function updateDetailDownloadBtn(d) {
+  const dl = document.getElementById('downloadBtn');
+  if (!dl || !d) return;
+  const key = String(d.id || '');
+  const dp = state.downloads[key];
+  const pct = (dp && dp.total > 0) ? Math.min(100, Math.round((dp.received / dp.total) * 100)) : 0;
+  if (dp && !dp.done && !dp.paused && !dp.error) {
+    dl.textContent = '暂停下载';
+  } else if (dp && dp.paused) {
+    dl.textContent = pct > 0 ? ('继续下载（已下 ' + pct + '%）') : '继续下载';
+  } else if (dp && dp.error && dp.error !== '已取消' && pct > 0) {
+    dl.textContent = '继续下载（已下 ' + pct + '%）';
+  } else {
+    dl.textContent = d.file_size ? ('下载到手机（' + fmtSize(d.file_size) + '）') : '下载到手机';
+  }
 }
 
 function renderDetailProgress(p) {
@@ -377,13 +447,23 @@ function renderDetailProgress(p) {
   const pct = p.total > 0 ? Math.min(100, Math.round((p.received / p.total) * 100)) : 0;
   document.getElementById('dlBarFill').style.width = pct + '%';
   const text = document.getElementById('dlText');
-  if (p.error) {
-    text.textContent = '下载失败：' + p.error;
+  if (p.paused) {
+    text.textContent = '已暂停 ' + pct + '%'
+      + (p.total ? '（' + fmtSize(p.received) + ' / ' + fmtSize(p.total) + '）' : '');
+  } else if (p.error) {
+    text.textContent = p.error === '已取消'
+      ? '已取消下载'
+      : ('已中断（保留 ' + pct + '%）：' + p.error);
   } else if (p.done) {
     text.textContent = '已保存到 Download/Wallpaper WE/';
   } else {
-    text.textContent = (p.phase || '下载中') + ' ' + pct + '%'
+    text.textContent = (p.phase || '下载中') + ' · ' + pct + '%'
       + (p.total ? '（' + fmtSize(p.received) + ' / ' + fmtSize(p.total) + '）' : '');
+  }
+  const curId = document.getElementById('detail').dataset.itemId;
+  if (curId && String(p.itemId) === String(curId)) {
+    const known = state.details[String(curId)] || { id: curId, file_size: p.total };
+    updateDetailDownloadBtn(Object.assign({ id: curId }, known));
   }
 }
 
@@ -391,7 +471,14 @@ function renderDetailProgress(p) {
 function resetDetailProgress(id) {
   const box = document.getElementById('dlProgress');
   if (!box) return;
-  const p = state.downloads[String(id)];
+  let p = state.downloads[String(id)];
+  if (!p) {
+    const stored = findStoredDownload(id);
+    if (stored && (stored.paused || stored.done || (stored.error && stored.received > 0))) {
+      p = stored;
+      state.downloads[String(id)] = p;
+    }
+  }
   if (p) {
     renderDetailProgress(p);
   } else {
@@ -637,18 +724,35 @@ document.getElementById('saveProxyBtn').onclick = () => {
 
 /* ---- steam ---- */
 let steam = {
-  loggedIn: false, busy: false, guard: false, guardType: '', guardEmail: '',
+  loggedIn: false, busy: false, restoring: false, reconnecting: false, hasToken: false,
+  guard: false, guardType: '', guardEmail: '',
   account: '', status: '未登录', error: '',
 };
 
 window.__steamState = function (st) {
   const wasLoggedIn = steam.loggedIn;
+  const wasRestoring = steam.restoring;
+  const prevAccount = steam.account;
   steam = Object.assign(steam, st || {});
   renderSteam();
-  if (wasLoggedIn !== steam.loggedIn && !steam.busy) {
-    // 登录/登出后切换数据源并刷新列表
-    state.page = 1;
-    loadPage();
+  if (!wasLoggedIn && steam.loggedIn && !steam.busy) {
+    clearTimeout(restoreWaitTimer);
+    restoreWaitTimer = null;
+    const accountChanged = !!(prevAccount && steam.account && prevAccount !== steam.account);
+    if (state.items.length > 0 && state.dataSource === 'online' && !accountChanged) {
+      return;
+    }
+    if (accountChanged) state.page = 1;
+    loadPage({ allowWebFallback: false });
+  } else if (wasLoggedIn && !steam.loggedIn && !steam.busy) {
+    if (!steam.hasToken && !steam.restoring && !steam.reconnecting && state.dataSource === 'online') {
+      state.page = 1;
+      loadPage({ allowWebFallback: true });
+    }
+  } else if (wasRestoring && !steam.restoring && !steam.loggedIn && !steam.busy && !steam.reconnecting && state.items.length === 0 && !state.loading) {
+    clearTimeout(restoreWaitTimer);
+    restoreWaitTimer = null;
+    loadPage({ allowWebFallback: true });
   }
 };
 
@@ -697,6 +801,14 @@ document.getElementById('steamGuardBtn').onclick = () => {
 
 document.getElementById('steamLogoutBtn').onclick = () => window.Bridge.steamLogout();
 
+/* 顶栏手动刷新：manual 绕过恢复期等待策略 */
+const refreshBtn = document.getElementById('refreshBtn');
+if (refreshBtn) {
+  refreshBtn.onclick = () => {
+    loadPage({ allowWebFallback: !steam.loggedIn, manual: true });
+  };
+}
+
 /* ---- download list ---- */
 function escHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, ch => ({
@@ -735,9 +847,26 @@ function closeDownloads() {
   document.getElementById('downloads').classList.add('hidden');
 }
 document.getElementById('downloadsBtn').onclick = openDownloads;
+(function setupBatchPauseBtn() {
+  const cancelBtn = document.getElementById('cancelAllBtn');
+  if (cancelBtn && cancelBtn.parentNode && !document.getElementById('pauseAllBtn')) {
+    const pauseAll = document.createElement('button');
+    pauseAll.id = 'pauseAllBtn';
+    pauseAll.className = 'btn-ghost';
+    pauseAll.textContent = '全部暂停';
+    pauseAll.onclick = () => {
+      if (window.Bridge.pauseAllDownloads) window.Bridge.pauseAllDownloads();
+      window.Bridge.toast('已暂停所有下载（进度已保留）');
+      setTimeout(renderDownloads, 300);
+    };
+    cancelBtn.parentNode.insertBefore(pauseAll, cancelBtn);
+  }
+})();
+
 document.getElementById('cancelAllBtn').onclick = () => {
   window.Bridge.cancelAllDownloads();
   window.Bridge.toast('已取消所有下载');
+  setTimeout(renderDownloads, 400);
 };
 
 document.getElementById('clearDownloadsBtn').onclick = () => {
@@ -757,24 +886,40 @@ function renderDownloads() {
   }
   arr.sort((a, b) => (b.time || 0) - (a.time || 0));
   box.innerHTML = arr.map(d => {
-    // 进度以内存里的实时回调为准（详情页同源），持久化记录可能滞后 1~2 秒
     const lp = state.downloads[String(d.id)];
-    let status = d.status;
+    let status = d.status || 'downloading';
     if (lp) {
       if (lp.error === '已取消') status = 'canceled';
+      else if (lp.paused) status = 'paused';
       else if (lp.error) status = 'failed';
       else if (lp.done) status = 'done';
       else status = 'downloading';
     }
-    const liveReceived = (lp && !lp.done && !lp.error) ? lp.received : d.received;
-    const liveTotal = (lp && lp.total > 0) ? lp.total : d.size;
+    const liveReceived = status === 'canceled'
+      ? 0
+      : ((lp && lp.received > 0) ? lp.received : (Number(d.received) || 0));
+    const liveTotal = (lp && lp.total > 0) ? lp.total : (Number(d.size) || 0);
     const pct = liveTotal > 0 ? Math.min(100, Math.round((liveReceived / liveTotal) * 100)) : 0;
     let statusText;
     if (status === 'done') statusText = '已完成';
-    else if (status === 'failed') statusText = '失败';
-    else if (status === 'canceled') statusText = '已取消';
+    else if (status === 'paused') {
+      statusText = '已暂停 ' + pct + '%' + (liveReceived > 0 ? ('（已下 ' + fmtSize(liveReceived) + '）') : '');
+    } else if (status === 'failed') {
+      statusText = pct > 0 ? ('已中断 ' + pct + '%（点继续接着下）') : '失败';
+    } else if (status === 'canceled') statusText = '已取消';
     else {
-      statusText = (lp && lp.phase && /自动重试|继续下载/.test(lp.phase)) ? lp.phase : ('下载中 ' + pct + '%');
+      statusText = (lp && lp.phase) ? (lp.phase + ' · ' + pct + '%') : ('下载中 ' + pct + '%');
+    }
+    let actionBtns = '';
+    if (status === 'done') {
+      actionBtns = '<button class="dl-open" data-open="' + escHtml(d.id) + '">打开文件夹</button>';
+    } else if (status === 'downloading') {
+      actionBtns = '<button class="dl-pause" data-pause="' + escHtml(d.id) + '">暂停</button>'
+        + '<button class="dl-cancel" data-cancel="' + escHtml(d.id) + '">取消</button>';
+    } else {
+      const resumeLabel = (status === 'paused' || pct > 0) ? '继续' : '重试';
+      actionBtns = '<button class="dl-retry" data-retry="' + escHtml(d.id) + '" data-manifest="' + escHtml(d.manifest || '') + '" data-title="' + escHtml(d.title || '') + '" data-img="' + escHtml(d.img || '') + '">' + resumeLabel + '</button>'
+        + '<button class="dl-del" data-del="' + escHtml(d.id) + '">移除</button>';
     }
     const img = d.img ? '<img src="' + escHtml(d.img) + '" alt="" loading="lazy">' : '<div class="dl-ph"></div>';
     return '<div class="dl-item" data-id="' + escHtml(d.id) + '"'
@@ -783,19 +928,11 @@ function renderDownloads() {
       + '<div class="dl-meta">'
       + '<div class="dl-title">' + escHtml(d.title || ('ID ' + d.id)) + '</div>'
       + '<div class="dl-status dl-' + escHtml(status) + '">' + statusText
-      + (d.size ? ' · ' + fmtSize(d.size) : '') + '</div>'
+      + (liveTotal ? ' · ' + fmtSize(liveTotal) : '') + '</div>'
       + '</div>'
-      + '<div class="dl-actions">'
-      + (status === 'done'
-        ? '<button class="dl-open" data-open="' + escHtml(d.id) + '">打开文件夹</button>'
-        : (status === 'downloading'
-          ? '<button class="dl-cancel" data-cancel="' + escHtml(d.id) + '">取消</button>'
-          : '<button class="dl-retry" data-retry="' + escHtml(d.id) + '" data-manifest="' + escHtml(d.manifest || '') + '" data-title="' + escHtml(d.title || '') + '" data-img="' + escHtml(d.img || '') + '">重试</button>'))
-      + (status === 'done' ? '' : '<button class="dl-del" data-del="' + escHtml(d.id) + '">移除</button>')
-      + '</div>'
+      + '<div class="dl-actions">' + actionBtns + '</div>'
       + '</div>';
   }).join('');
-  // 点击整条记录（非按钮区域）→ 跳到该条目的详情页
   box.querySelectorAll('.dl-item').forEach(el => {
     el.onclick = (e) => {
       if (e.target.closest('button')) return;
@@ -811,9 +948,18 @@ function renderDownloads() {
       window.Bridge.openDownloadFolder(btn.dataset.open);
     };
   });
+  box.querySelectorAll('.dl-pause').forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      if (window.Bridge.pauseDownload) window.Bridge.pauseDownload(btn.dataset.pause);
+      window.Bridge.toast('已暂停（已下载分块已保留）');
+      setTimeout(renderDownloads, 250);
+    };
+  });
   box.querySelectorAll('.dl-del').forEach(btn => {
     btn.onclick = (e) => {
       e.stopPropagation();
+      delete state.downloads[String(btn.dataset.del)];
       window.Bridge.removeDownload(btn.dataset.del);
       renderDownloads();
     };
@@ -822,8 +968,8 @@ function renderDownloads() {
     btn.onclick = (e) => {
       e.stopPropagation();
       if (window.Bridge.cancelDownloadById) window.Bridge.cancelDownloadById(btn.dataset.cancel);
-      window.Bridge.toast('正在取消…');
-      setTimeout(renderDownloads, 600);
+      window.Bridge.toast('已取消下载');
+      setTimeout(renderDownloads, 400);
     };
   });
   box.querySelectorAll('.dl-retry').forEach(btn => {
@@ -833,8 +979,8 @@ function renderDownloads() {
       if (!mid || mid === '0') { window.Bridge.toast('缺少源文件信息，请重新在详情页下载'); return; }
       if (window.Bridge.retryDownload) {
         window.Bridge.retryDownload(btn.dataset.retry, mid, btn.dataset.title || '', btn.dataset.img || '');
-        window.Bridge.toast('已重新开始下载');
-        setTimeout(renderDownloads, 800);
+        window.Bridge.toast('继续下载…');
+        setTimeout(renderDownloads, 500);
       }
     };
   });
@@ -842,38 +988,42 @@ function renderDownloads() {
 
 /* ---- download ---- */
 function startDownload(d) {
+  const key = String(d.id);
+  const cur = state.downloads[key];
+  const activeNow = (cur && !cur.done && !cur.paused && !cur.error)
+    || (window.Bridge.isDownloading && window.Bridge.isDownloading(key));
+  if (activeNow) {
+    if (window.Bridge.pauseDownload) {
+      window.Bridge.pauseDownload(key);
+      window.Bridge.toast('已暂停下载（已下进度已保留）');
+    }
+    return;
+  }
   if (!steam.loggedIn) {
     window.Bridge.toast('请先在设置中登录 Steam');
     openSettings();
     return;
   }
-  // 已经在下载中的条目不要重复启动（重复启动会并发写同一文件）
-  const key = String(d.id);
-  const cur = state.downloads[key];
-  if (cur && !cur.done && !cur.error) {
-    renderDetailProgress(cur);
-    window.Bridge.toast('该条目正在下载中…');
-    return;
-  }
-  if (window.Bridge.isDownloading && window.Bridge.isDownloading(key)) {
+  let mid = String((d && (d.hcontent_file || d.manifest)) || '0');
+  if (!mid || mid === '0') {
     try {
-      const raw = window.Bridge.downloadState ? window.Bridge.downloadState(key) : null;
-      if (raw) state.downloads[key] = JSON.parse(raw);
+      const arr = JSON.parse(window.Bridge.getDownloads() || '[]');
+      const hit = arr.find((x) => String(x.id) === key);
+      if (hit && hit.manifest) mid = String(hit.manifest);
     } catch (e) { /* ignore */ }
-    resetDetailProgress(key);
-    window.Bridge.toast('该条目正在下载中…');
-    return;
   }
-  const mid = String((d && (d.hcontent_file || d.manifest)) || '0');
   if (!mid || mid === '0') {
     window.Bridge.toast('该条目缺少源文件信息');
     return;
   }
+  const prevRec = cur && !cur.done && cur.error !== '已取消' ? (cur.received || 0) : 0;
+  const prevTot = (cur && cur.total) || Number(d.file_size) || 0;
+  const pct = prevTot > 0 ? Math.min(100, Math.round((prevRec / prevTot) * 100)) : 0;
   const box = document.getElementById('dlProgress');
   box.classList.remove('hidden');
-  document.getElementById('dlText').textContent = '准备下载…';
-  document.getElementById('dlBarFill').style.width = '0%';
-  window.Bridge.download(String(d.id), mid, String(d.title || ''), String(d.img || ''));
+  document.getElementById('dlText').textContent = prevRec > 0 ? ('正在从 ' + pct + '% 继续下载…') : '准备下载…';
+  document.getElementById('dlBarFill').style.width = pct + '%';
+  window.Bridge.download(key, mid, String(d.title || ''), String(d.img || d.preview_url || ''));
 }
 
 window.__downloadProgress = function (p) {
@@ -883,13 +1033,52 @@ window.__downloadProgress = function (p) {
     const dlg = document.getElementById('downloads');
     if (dlg && !dlg.classList.contains('hidden')) renderDownloads();
   } catch (e) { /* ignore */ }
-  // 只有当前详情页正在下载的条目才显示详情页进度条，其他任务不干扰浏览
   if (state.detailId == null || String(p.itemId) !== String(state.detailId)) {
     if (p.done) window.Bridge.toast('后台下载完成：已保存到 Download/Wallpaper WE/');
     return;
   }
   renderDetailProgress(p);
   if (p.done) window.Bridge.toast('下载完成，已保存到 Download/Wallpaper WE/');
+};
+
+/* 启动恢复询问：发现上次未完成下载时不静默偷跑，弹底部卡片由用户决定是否继续 */
+window.__promptInterruptedDownloads = function (items) {
+  if (!Array.isArray(items) || !items.length) return;
+  const old = document.getElementById('resumeBanner');
+  if (old) old.remove();
+  const banner = document.createElement('div');
+  banner.id = 'resumeBanner';
+  banner.className = 'resume-banner';
+  const text = document.createElement('div');
+  text.className = 'resume-banner-text';
+  const firstTitle = items[0] && items[0].title ? ('「' + items[0].title + '」') : '';
+  text.textContent = items.length === 1
+    ? ('上次下载的' + firstTitle + '尚未完成（进度已保留），是否继续下载？')
+    : ('发现 ' + items.length + ' 个未完成的壁纸下载（进度已保留），是否继续下载？');
+  const actions = document.createElement('div');
+  actions.className = 'resume-banner-actions';
+  const laterBtn = document.createElement('button');
+  laterBtn.type = 'button';
+  laterBtn.className = 'resume-btn-later';
+  laterBtn.textContent = '保持暂停';
+  laterBtn.onclick = () => banner.remove();
+  const okBtn = document.createElement('button');
+  okBtn.type = 'button';
+  okBtn.className = 'resume-btn-ok';
+  okBtn.textContent = '继续下载';
+  okBtn.onclick = () => {
+    banner.remove();
+    const ids = items.map((x) => x.id).filter(Boolean).join(',');
+    if (window.Bridge && window.Bridge.resumePausedDownloads) {
+      window.Bridge.resumePausedDownloads(ids);
+      window.Bridge.toast('已从断点继续下载');
+    }
+  };
+  actions.appendChild(laterBtn);
+  actions.appendChild(okBtn);
+  banner.appendChild(text);
+  banner.appendChild(actions);
+  document.body.appendChild(banner);
 };
 
 /* 前台定时同步：WebView 回调偶尔丢失时也能追上原生下载进度 */
@@ -911,6 +1100,22 @@ setInterval(function () {
   } catch (e) { /* ignore */ }
 }, 1000);
 
+/* 启动时先同步一次原生 Steam 状态（含 restoring），再发起首屏加载：
+   避免会话恢复期间盲目发起必卡 15~30 秒的网页匿名抓取 */
+function syncInitialSteamState() {
+  try {
+    if (window.Bridge && window.Bridge.steamState) {
+      const raw = window.Bridge.steamState();
+      if (raw) {
+        const st = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (st && typeof st === 'object') steam = Object.assign(steam, st);
+      }
+    }
+  } catch (e) { /* bridge 不可用时按未登录处理 */ }
+  renderSteam();
+}
+
 restoreFilters();
 applyFilterUI();
+syncInitialSteamState();
 loadPage();

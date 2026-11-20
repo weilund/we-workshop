@@ -33,23 +33,34 @@ public class Bridge {
         SteamService.setGuardListener(this::pushSteamGuard);
         WorkshopDownloader.setProgressListener(this::pushDownloadProgress);
         DownloadStore.init(activity);
+        // 启动即归档：把「记录说在下载、但进程里没有任务」的条目改成 paused，
+        // 等用户在弹窗里决定是否继续，绝不静默自动开跑。
+        try {
+            WorkshopDownloader.markInterruptedAsPaused(activity);
+        } catch (Throwable ignored) {
+        }
         SteamService.init(activity);
     }
 
-    private boolean resumeInterruptedTriggered = false;
+    private boolean interruptedPromptSent = false;
 
     private void pushSteamState() {
         final String js = "window.__steamState && window.__steamState(" + SteamService.stateJson() + ")";
         main.post(() -> webView.evaluateJavascript(js, null));
-        // 登录恢复完成后，把进程被杀时中断的下载重新拉起来（只触发一次）
-        if (!resumeInterruptedTriggered && SteamService.INSTANCE.isLoggedIn()) {
-            resumeInterruptedTriggered = true;
-            pool.execute(() -> {
-                try {
-                    WorkshopDownloader.resumeInterrupted(activity);
-                } catch (Throwable ignored) {
-                }
-            });
+        // 登录恢复后不再静默续传：把上次被中断的条目交给前端弹窗，由用户选择是否继续。
+        if (!interruptedPromptSent && SteamService.INSTANCE.isLoggedIn()) {
+            interruptedPromptSent = true;
+            String pendingJson;
+            try {
+                pendingJson = WorkshopDownloader.consumeInterruptedPromptJson(activity);
+            } catch (Throwable t) {
+                pendingJson = null;
+            }
+            if (pendingJson != null) {
+                final String promptJs = "window.__promptInterruptedDownloads && window.__promptInterruptedDownloads("
+                        + pendingJson + ")";
+                main.postDelayed(() -> webView.evaluateJavascript(promptJs, null), 600);
+            }
         }
     }
 
@@ -61,12 +72,15 @@ public class Bridge {
     }
 
     private void pushDownloadProgress(long itemId, long received, long total,
-                                      String phase, boolean done, String error) {
+                                      String phase, boolean done, boolean paused, String error) {
+        if (!MainActivity.isForeground && !done && !paused && error == null) {
+            return;
+        }
         String err = error == null ? "null" : JSONObject.quote(error);
         final String js = "window.__downloadProgress && window.__downloadProgress({itemId:" + itemId
                 + ",received:" + received + ",total:" + total
                 + ",phase:" + JSONObject.quote(phase)
-                + ",done:" + done + ",error:" + err + "})";
+                + ",done:" + done + ",paused:" + paused + ",error:" + err + "})";
         main.post(() -> webView.evaluateJavascript(js, null));
     }
 
@@ -172,6 +186,7 @@ public class Bridge {
     @JavascriptInterface
     public void download(String itemId, String manifestId, String title, String img) {
         try {
+            main.post(() -> MainActivity.promptBatteryExemptionOnce(activity));
             WorkshopDownloader.downloadAsync(activity,
                     Long.parseLong(itemId), Long.parseLong(manifestId), title, img);
         } catch (NumberFormatException e) {
@@ -256,7 +271,7 @@ public class Bridge {
     @JavascriptInterface
     public void cancelAllDownloads() {
         try {
-            WorkshopDownloader.cancel();
+            WorkshopDownloader.cancel(activity);
         } catch (Throwable ignored) {
         }
     }
@@ -264,9 +279,39 @@ public class Bridge {
     @JavascriptInterface
     public void cancelDownloadById(String itemId) {
         try {
-            WorkshopDownloader.cancel(Long.parseLong(itemId));
+            WorkshopDownloader.cancel(activity, Long.parseLong(itemId));
         } catch (NumberFormatException ignored) {
         }
+    }
+
+    /** 暂停单条下载：保留已下载分块，稍后可继续。 */
+    @JavascriptInterface
+    public void pauseDownload(String itemId) {
+        try {
+            WorkshopDownloader.pause(activity, Long.parseLong(itemId));
+        } catch (NumberFormatException ignored) {
+        }
+    }
+
+    /** 暂停全部正在下载的条目。 */
+    @JavascriptInterface
+    public void pauseAllDownloads() {
+        try {
+            WorkshopDownloader.pauseAll(activity);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 继续已暂停的下载：idsCsv 为空则恢复全部暂停条目。 */
+    @JavascriptInterface
+    public void resumePausedDownloads(String idsCsv) {
+        pool.execute(() -> {
+            try {
+                main.post(() -> MainActivity.promptBatteryExemptionOnce(activity));
+                WorkshopDownloader.resumePaused(activity, idsCsv);
+            } catch (Throwable ignored) {
+            }
+        });
     }
 
     /** 重新下载失败/已取消的条目（下载列表里的「重试」按钮）。
@@ -317,7 +362,8 @@ public class Bridge {
     @JavascriptInterface
     public void removeDownload(String itemId) {
         try {
-            DownloadStore.remove(Long.parseLong(itemId));
+            // 走 removeAndClean：停协程 + 删未完成分块 + 清内存 + 删记录
+            WorkshopDownloader.removeAndClean(activity, Long.parseLong(itemId));
         } catch (NumberFormatException ignored) {
         }
     }

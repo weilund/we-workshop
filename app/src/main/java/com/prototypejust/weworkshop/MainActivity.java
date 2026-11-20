@@ -1,10 +1,16 @@
 package com.prototypejust.weworkshop;
 
+import android.Manifest;
 import android.app.Activity;
+import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.view.WindowInsets;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -25,6 +31,9 @@ public class MainActivity extends Activity {
 
     static int safeTopPx = 0;
     static int safeBottomPx = 0;
+
+    public static volatile boolean isForeground = false;
+    private static volatile boolean batteryPromptShown = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -91,6 +100,37 @@ public class MainActivity extends Activity {
 
         setContentView(webView);
         webView.loadUrl("file:///android_asset/index.html");
+        requestNotificationPermissionIfNeeded();
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1001);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** 首次发起下载时若未加入系统省电白名单，拉起系统一键无限制运行授权弹窗（每次运行最多弹一次）。 */
+    public static void promptBatteryExemptionOnce(Activity activity) {
+        if (activity == null || batteryPromptShown || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return;
+        }
+        try {
+            PowerManager pm = (PowerManager) activity.getSystemService(POWER_SERVICE);
+            String pkg = activity.getPackageName();
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(pkg)) {
+                batteryPromptShown = true;
+                Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                intent.setData(Uri.parse("package:" + pkg));
+                activity.startActivity(intent);
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /** 把安全区高度发给网页；网页用 CSS 变量避开状态栏和手势条。
@@ -120,6 +160,18 @@ public class MainActivity extends Activity {
             return getResources().getDimensionPixelSize(resId);
         }
         return Math.round(48 * getResources().getDisplayMetrics().density);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        isForeground = true;
+    }
+
+    @Override
+    protected void onStop() {
+        isForeground = false;
+        super.onStop();
     }
 
     @Override
